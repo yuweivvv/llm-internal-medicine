@@ -14,7 +14,7 @@
 ### 统一 API
 
 ```python
-from src.internal_medicine import setup_internal_medicine
+from internal_medicine import setup_internal_medicine
 
 # 创建 monitor_dict 用于存储 monitor 实例
 monitor_dict = {}
@@ -54,7 +54,7 @@ cfg.model.register_pre_wrap_hook(partial(
 ### 读取指标
 
 ```python
-from src.internal_medicine import training_logs
+from internal_medicine import training_logs
 
 # 获取全部最新指标
 all_metrics = training_logs.get_latest()
@@ -182,7 +182,7 @@ setup_internal_medicine()
 全局单例的指标存储，所有 Monitor 将指标写入此处。
 
 ```python
-from src.internal_medicine import training_logs
+from internal_medicine import training_logs
 ```
 
 **SmoothedValue 聚合模式** — 由指标键名自动推断：
