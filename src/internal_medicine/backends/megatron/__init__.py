@@ -1,0 +1,57 @@
+"""Megatron-Bridge backend for internal_medicine."""
+
+import logging
+
+from .gather import install_gather_fn
+from .moe_monitor import MoESpecialistMonitor, setup_moe_monitor
+from .ple_monitor import PLEHealthMonitor, setup_ple_monitor
+from .qk_monitor import QKStatsMonitor, setup_qk_monitor
+
+logger = logging.getLogger(__name__)
+
+_MONITOR_MAP = {
+    "qk_stats": setup_qk_monitor,
+    "moe_health": setup_moe_monitor,
+    "ple_health": setup_ple_monitor,
+}
+
+
+def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
+    """Setup all requested monitors on a Megatron model."""
+    install_gather_fn()
+
+    if monitors is None:
+        monitors = ["all"]
+    if "all" in monitors:
+        monitors = list(_MONITOR_MAP.keys())
+    if monitor_dict is None:
+        monitor_dict = {}
+
+    for name in monitors:
+        if name not in _MONITOR_MAP:
+            logger.warning(f"[InternalMedicine/megatron] Unknown monitor: {name}, skipping")
+            continue
+        try:
+            _MONITOR_MAP[name](
+                model,
+                monitor_dict=monitor_dict,
+                monitor_interval=monitor_interval,
+                verbose=verbose,
+                **kwargs.get(name, {}),
+            )
+            logger.info(f"[InternalMedicine/megatron] Enabled monitor: {name}")
+        except Exception as e:
+            logger.error(f"[InternalMedicine/megatron] Failed to setup {name}: {e}")
+
+    return model
+
+
+__all__ = [
+    "setup_monitors",
+    "QKStatsMonitor",
+    "setup_qk_monitor",
+    "MoESpecialistMonitor",
+    "setup_moe_monitor",
+    "PLEHealthMonitor",
+    "setup_ple_monitor",
+]
