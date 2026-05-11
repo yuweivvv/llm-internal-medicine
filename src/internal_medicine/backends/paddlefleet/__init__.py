@@ -1,0 +1,56 @@
+"""PaddleFleet backend for internal_medicine."""
+
+import logging
+
+from .gather import install_gather_fn
+from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
+from .qk_monitor import PaddleQKStatsMonitor, setup_qk_monitor
+
+logger = logging.getLogger(__name__)
+
+_MONITOR_MAP = {
+    "qk_stats": setup_qk_monitor,
+    "moe_health": setup_moe_monitor,
+}
+
+
+def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
+    """Setup all requested monitors on a PaddleFleet model."""
+    install_gather_fn()
+
+    if monitors is None:
+        monitors = ["all"]
+    if "all" in monitors:
+        monitors = list(_MONITOR_MAP.keys())
+    if monitor_dict is None:
+        monitor_dict = {}
+
+    for name in monitors:
+        if name not in _MONITOR_MAP:
+            if name == "ple_health":
+                logger.info("[InternalMedicine/paddlefleet] PLE monitor not available for PaddleFleet, skipping")
+            else:
+                logger.warning(f"[InternalMedicine/paddlefleet] Unknown monitor: {name}, skipping")
+            continue
+        try:
+            _MONITOR_MAP[name](
+                model,
+                monitor_dict=monitor_dict,
+                monitor_interval=monitor_interval,
+                verbose=verbose,
+                **kwargs.get(name, {}),
+            )
+            logger.info(f"[InternalMedicine/paddlefleet] Enabled monitor: {name}")
+        except Exception as e:
+            logger.error(f"[InternalMedicine/paddlefleet] Failed to setup {name}: {e}")
+
+    return model
+
+
+__all__ = [
+    "setup_monitors",
+    "PaddleQKStatsMonitor",
+    "setup_qk_monitor",
+    "PaddleMoEMonitor",
+    "setup_moe_monitor",
+]
