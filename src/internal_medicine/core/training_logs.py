@@ -17,10 +17,9 @@ __all__ = ("SmoothedValue", "TrainingLogs", "training_logs")
 class SmoothedValue:
     """Track a series of scalar values and provide smoothed access."""
 
-    def __init__(self, skip_zero=False, mode="mean"):
+    def __init__(self, mode="mean"):
         self.total = 0.0
         self.count = 0
-        self._skip_zero = skip_zero
         self.mode = mode
         if self.mode == "max":
             self.max_value = float("-inf")
@@ -28,8 +27,6 @@ class SmoothedValue:
             self.min_value = float("inf")
 
     def update(self, value: float):
-        if self._skip_zero and value == 0:
-            return
         self.count += 1
         self.total += value
         if self.mode == "max":
@@ -96,13 +93,6 @@ class TrainingLogs:
 
     def __getitem__(self, v):
         return self.meters[v]
-
-    def __getattr__(self, attr):
-        if attr in ("meters", "_gather_fn"):
-            raise AttributeError(attr)
-        if attr in self.meters:
-            return self.meters[attr]
-        raise AttributeError(f"'{type(self).__name__}' has no attribute '{attr}'")
 
     def dict(self):
         return {k: v.log for k, v in self.meters.items()}
