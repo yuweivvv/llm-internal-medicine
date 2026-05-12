@@ -157,7 +157,7 @@ class QKStatsMonitor(BaseMonitor):
 
 
 def setup_qk_monitor(
-    model: list[nn.Module] | nn.Module,
+    model: nn.Module,
     causal: bool = True,
     use_triton: bool = True,
     verbose: bool = False,
@@ -166,7 +166,7 @@ def setup_qk_monitor(
     monitor_interval: int = 1,
     monitor_dict: dict | None = None,
     return_monitor: bool = False,
-) -> list[nn.Module] | nn.Module:
+) -> nn.Module:
     monitor = QKStatsMonitor(
         causal=causal,
         use_triton=use_triton,
@@ -175,9 +175,7 @@ def setup_qk_monitor(
         monitor_interval=monitor_interval,
         verbose=verbose,
     )
-    models = [model] if not isinstance(model, list) else model
-    for m in models:
-        monitor.register_hooks(m)
+    monitor.register_hooks(model)
     logger.info(f"[QKMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
     if monitor_dict is not None:
         monitor_dict["qk_stats"] = monitor
