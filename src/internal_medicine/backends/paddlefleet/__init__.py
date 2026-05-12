@@ -27,10 +27,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
 
     for name in monitors:
         if name not in _MONITOR_MAP:
-            if name == "ple_health":
-                logger.info("[InternalMedicine/paddlefleet] PLE monitor not available for PaddleFleet, skipping")
-            else:
-                logger.warning(f"[InternalMedicine/paddlefleet] Unknown monitor: {name}, skipping")
+            logger.warning(f"[InternalMedicine/paddlefleet] Unknown monitor: {name}, skipping")
             continue
         try:
             _MONITOR_MAP[name](

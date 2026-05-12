@@ -28,17 +28,6 @@ def _compute_router_entropy(probs):
     return float(entropy.mean())
 
 
-def _compute_topk_score_sum(scores, topk):
-    """TopK score sum statistics."""
-    topk_scores = scores.astype("float32").topk(topk, axis=-1)[0]
-    score_sum = topk_scores.sum(axis=-1)
-    return {
-        "score_sum_mean": float(score_sum.mean()),
-        "score_sum_min": float(score_sum.min()),
-        "score_sum_max": float(score_sum.max()),
-    }
-
-
 def _compute_expert_norms_paddle(weight_list):
     """Compute L2 norms for a list of paddle weight tensors."""
     if not weight_list:
@@ -57,6 +46,7 @@ class PaddleMoEMonitor(BaseMonitor):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
+        self.pp_rank = 0
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -109,8 +99,19 @@ class PaddleMoEMonitor(BaseMonitor):
         return moe_layers
 
     def _get_decoder_layers(self, model):
+        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
+            model = model._layers
         if hasattr(model, "module"):
             model = model.module
+        if hasattr(model, "run_function"):
+            return [
+                layer
+                for layer in model.run_function
+                if hasattr(layer, "self_attn")
+                or hasattr(layer, "self_attention")
+                or (hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"))
+                or hasattr(layer, "moe")
+            ]
         if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
             return model.decoder.layers
         if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
@@ -119,7 +120,12 @@ class PaddleMoEMonitor(BaseMonitor):
             return model.layers
         transformer_layers = []
         for _name, sublayer in model.named_sublayers():
-            if sublayer.__class__.__name__ == "TransformerLayer":
+            if (
+                hasattr(sublayer, "self_attn")
+                or hasattr(sublayer, "self_attention")
+                or (hasattr(sublayer, "mlp") and hasattr(sublayer.mlp, "gate"))
+                or hasattr(sublayer, "moe")
+            ):
                 transformer_layers.append(sublayer)
         return transformer_layers if transformer_layers else None
 
@@ -162,7 +168,7 @@ class PaddleMoEMonitor(BaseMonitor):
 
         # outputs is the 8-tuple from TopKRouter
         if isinstance(outputs, tuple) and len(outputs) >= 5:
-            _, topk_weights, topk_indices, gates_masked, mask = outputs[:5]
+            _, topk_weights, _, gates_masked, _ = outputs[:5]
 
             # Router entropy from gates_masked (non-zero entries form the prob distribution)
             if gates_masked is not None:
@@ -255,7 +261,6 @@ def setup_moe_monitor(
     monitor_interval=1,
     verbose=False,
     monitor_dict=None,
-    return_monitor=False,
 ):
     monitor = PaddleMoEMonitor(
         log_per_layer=log_per_layer,
@@ -263,12 +268,8 @@ def setup_moe_monitor(
         monitor_interval=monitor_interval,
         verbose=verbose,
     )
-    models = [model] if not isinstance(model, list) else model
-    for m in models:
-        monitor.register_hooks(m)
+    monitor.register_hooks(model)
     logger.info(f"[PaddleMoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["moe_health"] = monitor
-    if return_monitor:
-        return model, monitor
     return model
