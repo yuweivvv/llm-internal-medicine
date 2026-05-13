@@ -30,6 +30,8 @@ class MoESpecialistMonitor(BaseMonitor):
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.moe_layers: list[weakref.ref] = []
+        self._global_accum = {}
+        self._global_count = 0
 
     def register_hooks(self, model: nn.Module):
         try:
@@ -152,7 +154,11 @@ class MoESpecialistMonitor(BaseMonitor):
                 log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
         if self.log_global:
             for name, val in metrics.items():
-                log_dict[f"moe_health/global_{name}"] = val
+                if "max" in name or "std" in name:
+                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+                else:
+                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+            self._global_count += 1
         if log_dict:
             training_logs.update(**log_dict)
 
@@ -208,9 +214,31 @@ class MoESpecialistMonitor(BaseMonitor):
                 log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
         if self.log_global:
             for name, val in metrics.items():
-                log_dict[f"moe_health/global_{name}"] = val
+                if "max" in name or "std" in name or "norm_std" in name:
+                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+                else:
+                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+            self._global_count += 1
         if log_dict:
             training_logs.update(**log_dict)
+
+    def _flush_global_metrics(self):
+        if self._global_count == 0:
+            return
+        log_dict = {}
+        for name, val in self._global_accum.items():
+            if "max" in name or "std" in name or "norm_std" in name:
+                log_dict[f"moe_health/global_{name}"] = val
+            else:
+                log_dict[f"moe_health/global_{name}"] = val / self._global_count
+        training_logs.update(**log_dict)
+        self._global_accum = {}
+        self._global_count = 0
+
+    def step(self):
+        super().step()
+        if self.log_global:
+            self._flush_global_metrics()
 
     def remove_hooks(self):
         super().remove_hooks()

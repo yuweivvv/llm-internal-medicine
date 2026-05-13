@@ -11,9 +11,13 @@ import torch.nn as nn
 
 from ...core.base_monitor import BaseMonitor
 from ...core.training_logs import training_logs
+from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats
 
 logger = logging.getLogger(__name__)
+
+# Above this seq_len, skip QK stats to avoid OOM in pytorch fallback path
+_MAX_SEQ_LEN_FOR_QK = 8192
 
 
 class QKStatsMonitor(BaseMonitor):
@@ -25,16 +29,21 @@ class QKStatsMonitor(BaseMonitor):
         log_global: bool = True,
         monitor_interval: int = 1,
         verbose: bool = False,
+        sink_head_threshold: float = 0.3,
     ):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.causal = causal
         self.use_triton = use_triton
+        self.sink_head_threshold = sink_head_threshold
         self.compute_count = 0
         self.tp_size = 1
         self.tp_rank = 0
+        self.pp_rank = 0
         self.tp_group = None
+        self._global_accum = {}
+        self._global_count = 0
 
     def register_hooks(self, model: nn.Module):
         try:
@@ -108,13 +117,36 @@ class QKStatsMonitor(BaseMonitor):
             dist.all_gather(gathered_list, local_head_entropy, group=self.tp_group)
             full_head_entropy = torch.cat(gathered_list)
 
+        # Aggregate sink_per_head across TP ranks
+        local_sink = stats["sink_per_head"].mean(dim=0) if stats["sink_per_head"].dim() > 1 else stats["sink_per_head"]
+        full_sink = local_sink
+        if self.tp_size > 1 and self.tp_group is not None:
+            gathered_sink = [torch.zeros_like(local_sink) for _ in range(self.tp_size)]
+            dist.all_gather(gathered_sink, local_sink, group=self.tp_group)
+            full_sink = torch.cat(gathered_sink)
+
         return {
             "max_global": max_val.item(),
             "mean_global": avg_vals[0].item(),
             "entropy_global": avg_vals[1].item(),
             "sink_global": avg_vals[2].item(),
             "entropy_per_head_tensor": full_head_entropy,
+            "sink_per_head": full_sink,
         }
+
+    def _flush_global_metrics(self):
+        """Aggregate accumulated per-layer metrics into global metrics."""
+        if self._global_count == 0:
+            return
+        log_dict = {}
+        for name, val in self._global_accum.items():
+            if "max" in name:
+                log_dict[f"qk_stats/global_{name}"] = val
+            else:
+                log_dict[f"qk_stats/global_{name}"] = val / self._global_count
+        training_logs.update(**log_dict)
+        self._global_accum = {}
+        self._global_count = 0
 
     def _make_compute_hook(self, layer_idx: int):
         def hook_fn(module, args):
@@ -123,7 +155,14 @@ class QKStatsMonitor(BaseMonitor):
             if not self._should_monitor():
                 return
             try:
-                query, key = args[0], args[1]
+                query, key = args[0].detach(), args[1].detach()
+                if query.dim() == 3:
+                    # THD format [T, H, D] → SBHD [S, B, H, D] with B=1
+                    query = query.unsqueeze(1)
+                    key = key.unsqueeze(1)
+                seq_len = query.shape[0] if query.dim() == 4 and query.shape[1] == 1 else query.shape[-2]
+                if seq_len > _MAX_SEQ_LEN_FOR_QK and not self.use_triton:
+                    return
                 with torch.no_grad():
                     stats = compute_qk_stats(query, key, causal=self.causal, use_triton=self.use_triton)
                 if self.tp_size > 1 and dist.is_initialized():
@@ -132,6 +171,13 @@ class QKStatsMonitor(BaseMonitor):
                     stats["entropy_per_head_tensor"] = stats["entropy_per_head"].mean(dim=0)
 
                 all_heads = stats["entropy_per_head_tensor"]
+                # Sink head classification (Sun et al. 2026, arXiv:2603.05498)
+                sink_per_head = stats["sink_per_head"]
+                sink_for_classify = sink_per_head.mean(dim=0) if sink_per_head.dim() > 1 else sink_per_head
+                sink_class = compute_sink_head_classification(
+                    sink_for_classify, threshold=self.sink_head_threshold
+                )
+
                 metrics = {
                     "max": stats["max_global"],
                     "mean": stats["mean_global"],
@@ -140,6 +186,9 @@ class QKStatsMonitor(BaseMonitor):
                     "entropy_min": all_heads.min().item(),
                     "entropy_max": all_heads.max().item(),
                     "entropy_std": all_heads.std().item(),
+                    "sink_head_ratio": sink_class["sink_head_ratio"].item(),
+                    "sink_head_max": sink_class["sink_head_max"].item(),
+                    "sink_nonsink_gap": sink_class["sink_nonsink_gap"].item(),
                 }
                 log_dict = {}
                 if self.log_per_layer:
@@ -147,13 +196,24 @@ class QKStatsMonitor(BaseMonitor):
                         log_dict[f"qk_stats/layer_{layer_idx}/{name}"] = val
                 if self.log_global:
                     for name, val in metrics.items():
-                        log_dict[f"qk_stats/global_{name}"] = val
-                training_logs.update(**log_dict)
+                        if "max" in name:
+                            self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+                        else:
+                            self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+                    self._global_count += 1
+                if log_dict:
+                    training_logs.update(**log_dict)
                 self.compute_count += 1
             except Exception as e:
                 logger.error(f"[QKMonitor] Error layer {layer_idx}: {e}")
 
         return hook_fn
+
+    def step(self):
+        """Tick step counter and flush global metrics."""
+        super().step()
+        if self.log_global:
+            self._flush_global_metrics()
 
 
 def setup_qk_monitor(
@@ -164,8 +224,8 @@ def setup_qk_monitor(
     log_per_layer: bool = True,
     log_global: bool = True,
     monitor_interval: int = 1,
+    sink_head_threshold: float = 0.3,
     monitor_dict: dict | None = None,
-    return_monitor: bool = False,
 ) -> nn.Module:
     monitor = QKStatsMonitor(
         causal=causal,
@@ -174,11 +234,12 @@ def setup_qk_monitor(
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        sink_head_threshold=sink_head_threshold,
     )
-    monitor.register_hooks(model)
+    models = [model] if not isinstance(model, list) else model
+    for m in models:
+        monitor.register_hooks(m)
     logger.info(f"[QKMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
     if monitor_dict is not None:
         monitor_dict["qk_stats"] = monitor
-    if return_monitor:
-        return model, monitor
     return model
