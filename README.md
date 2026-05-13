@@ -2,10 +2,11 @@
 
 训练时模型健康的实时监控框架，通过 forward hook 零侵入式采集指标，不影响训练梯度。
 
-包含三大监控模块：
+包含四大监控模块：
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
-- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (7 指标)
+- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (10 指标)
+- **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (6 指标)
 
 ---
 
@@ -82,7 +83,8 @@ training_logs.reset()
 setup_internal_medicine()
     ├── setup_ple_monitor()   → PLEHealthMonitor   → forward hooks on PLE modules
     ├── setup_moe_monitor()   → MoESpecialistMonitor → forward hooks on MoE layers
-    └── setup_qk_monitor()    → QKStatsMonitor     → forward pre-hooks on core_attention
+    ├── setup_qk_monitor()    → QKStatsMonitor     → forward pre-hooks on core_attention
+    └── setup_massive_activation_monitor() → MassiveActivationMonitor → forward pre-hooks on transformer layers
                                         │
                                         ▼
                               training_logs (singleton)
@@ -99,7 +101,7 @@ setup_internal_medicine()
 {monitor_name}/global_{metric_name}                 # 全局聚合指标
 ```
 
-- `monitor_name`: `ple_health` | `moe_health` | `qk_stats`
+- `monitor_name`: `ple_health` | `moe_health` | `qk_stats` | `massive_act`
 - `global_idx`: 考虑 PP (Pipeline Parallelism) 的全局层索引 = `pp_rank × local_layers + local_idx`
 
 ---
@@ -162,6 +164,7 @@ setup_internal_medicine()
 > 详细文档: [qk_logits/readme.md](./qk_logits/readme.md)
 
 监控注意力 QK logit 的数值稳定性、集中度和 sink 现象。基于 Triton Online Softmax 内核高效计算。
+新增 Sink Head 分类指标，基于 Sun et al. (2026) arXiv:2603.05498 的发现。
 
 | # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
 |---|------|--------|------|------|----------|
@@ -172,8 +175,37 @@ setup_internal_medicine()
 | 5 | `entropy_min` | `qk_stats/.../entropy_min` | `min(per_head_entropy)` | 每层+全局 | 最尖锐 head 的熵 |
 | 6 | `entropy_max` | `qk_stats/.../entropy_max` | `max(per_head_entropy)` | 每层+全局 | 最分散 head 的熵 |
 | 7 | `entropy_std` | `qk_stats/.../entropy_std` | `std(per_head_entropy)` | 每层+全局 | Head 行为分化度 |
+| 8 | `sink_head_ratio` | `qk_stats/.../sink_head_ratio` | `count(sink>θ)/N_heads` | 每层+全局 | Sink head 占比 |
+| 9 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
+| 10 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 
 ---
+
+
+---
+
+## 四、Massive Activation Monitor (massive_act)
+
+> 详细文档: [massive_activation.md](./docs/massive_activation.md)
+
+监控 Residual Stream 中的 Massive Activations（极端异常激活值）。
+基于 Sun et al. (2026) "The Spike, the Sparse and the Sink" (arXiv:2603.05498) 的发现。
+
+| # | 指标 | 日志键 | 公式 | 级别 | 诊断意义 |
+|---|------|--------|------|------|----------|
+| 1 | `channel_max` | `massive_act/.../channel_max` | `max(abs(H_i))` | 每层+全局 | 通道峰值，追踪 spike 生命周期 |
+| 2 | `channel_max_ratio` | `massive_act/.../channel_max_ratio` | `max / median` | 每层+全局 | 异常值严重度 |
+| 3 | `massive_act_channel_count` | `massive_act/.../massive_act_channel_count` | `count(ch > 100*med)` | 每层+全局 | 异常通道数量 |
+| 4 | `top3_channel_norm` | `massive_act/.../top3_channel_norm` | `norm(topk(3))` | 每层+全局 | 对应论文 Figure 1 |
+| 5 | `post_norm_sparsity` | `massive_act/.../post_norm_sparsity` | `mean(abs(x) < eps)` | 每层+全局 | 归一化后稀疏度 |
+| 6 | `post_norm_cosine` | `massive_act/.../post_norm_cosine` | `cos_sim(tokens)` | 每层+全局 | 近常量向量检测 |
+
+### 核心洞察
+
+Massive activations 是 pre-norm Transformer 的**架构副产品**，独立于模型性能：
+- PPL 不变但 spike 暴涨 → 部署时量化精度严重退化
+- Spike token 经 RMSNorm 后变成稀疏近常量向量 → 为 attention sink 创造条件
+- 监控 spike lifecycle (rise-plateau-fall) 可定位 step-up/step-down blocks
 
 ## 基础设施
 
@@ -220,7 +252,7 @@ from internal_medicine import training_logs
 
 ## 附录: 完整指标速查表
 
-共 27 个指标键 (7 PLE + 13 MoE + 7 QK)。
+共 36 个指标键 (7 PLE + 13 MoE + 10 QK + 6 MassiveAct)。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -251,3 +283,12 @@ from internal_medicine import training_logs
 | **QK** | `entropy_min` | `min(head_H)` | min | 不应过低 |
 | **QK** | `entropy_max` | `max(head_H)` | max | 合理范围 |
 | **QK** | `entropy_std` | `std(head_H)` | mean | 适度分化 |
+| **QK** | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | Sink head 占比 |
+| **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
+| **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |
+| **MassiveAct** | `channel_max` | `max(abs(H_i))` | max | 通道峰值激活 |
+| **MassiveAct** | `channel_max_ratio` | `max / median` | max | 异常值严重度 |
+| **MassiveAct** | `massive_act_channel_count` | `count(ch > 100*median)` | mean | 异常通道数 |
+| **MassiveAct** | `top3_channel_norm` | `norm(topk(3))` | mean | Top-3 通道范数 |
+| **MassiveAct** | `post_norm_sparsity` | `mean(abs(x) < eps)` | mean | 归一化后稀疏度 |
+| **MassiveAct** | `post_norm_cosine` | `cos_sim(tokens)` | mean | 近常量向量检测 |
