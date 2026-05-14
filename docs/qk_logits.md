@@ -141,6 +141,64 @@ entropy_std = std(entropy_per_head)
 
 ---
 
+
+---
+
+### 8. Sink Head Ratio (Sink Head 占比)
+
+**数学公式:**
+```
+sink_head_ratio = count(sink_per_head > threshold) / num_heads
+```
+
+被分类为 "sink head" 的 head 占总 head 数的比例。默认阈值 0.3。
+
+**理论基础:**
+Sun et al. (2026, arXiv:2603.05498) 证明 attention sinks 是 per-head 现象：
+某些 head 将 >30% 注意力分配给 token-0，作为 "learned gate" 来关闭不需要的信息通道。
+
+**诊断意义:**
+- **0.0 ~ 0.3**: 正常，少数 head 有 sink 行为
+- **0.3 ~ 0.6**: 显著 sink 行为，模型在积极使用 implicit gating
+- **> 0.6**: 大部分 head 都是 sink head，可能影响长上下文能力
+
+---
+
+### 9. Sink Head Max (最强 Sink Head 权重)
+
+**数学公式:**
+```
+sink_head_max = max(sink_per_head)
+```
+
+所有 head 中对 token-0 分配的最大平均注意力权重。
+
+**诊断意义:**
+- 识别最极端的 sink head
+- 值接近 1.0 说明该 head 几乎完全 "dormant"（所有注意力给 token-0）
+- 可用于定位 pruning 候选 head
+
+---
+
+### 10. Sink Non-Sink Gap (Sink/非Sink Gap)
+
+**数学公式:**
+```
+sink_nonsink_gap = mean(sink_heads_weight) - mean(nonsink_heads_weight)
+```
+
+Sink heads 和非 sink heads 在 token-0 注意力权重上的差异。
+
+**理论基础:**
+这是 "logit gap" 的代理指标。Sun et al. 发现 sink head 中 k^(s) 和 q^(n) 的子空间
+比非 sink head 更接近（Figure 6），产生持续的 logit gap。
+
+**诊断意义:**
+- 高 gap = sink/非sink 分化明显，模型在清晰地区分两类 head
+- 低 gap = 所有 head 行为相似，没有强 sink 分化
+- Gap 上升趋势 = 模型在训练中逐步强化 sink 策略
+
+
 ## Triton 内核说明
 
 ### Online Softmax 算法
