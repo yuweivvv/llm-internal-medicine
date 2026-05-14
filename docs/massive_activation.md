@@ -1,4 +1,4 @@
-# Spike Health Monitor
+# Massive Activation Monitor
 
 **Residual Stream Massive Activation 健康监控模块**，监控 6 个核心指标。
 
@@ -67,11 +67,11 @@ channel_max_ratio = max(per_channel_max) / median(per_channel_max)
 
 ---
 
-### 3. Spike Channel Count (异常通道数)
+### 3. Massive Activation Channel Count (异常通道数)
 
 **数学公式：**
 ```
-spike_channel_count = |{c : max_pos(|H_i[:, c]|) > median × threshold_multiplier}|
+massive_act_channel_count = |{c : max_pos(|H_i[:, c]|) > median × threshold_multiplier}|
 ```
 
 超过阈值（默认 100× 中位数）的 channel 数量。
@@ -154,7 +154,7 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 | `channel_max_ratio` | < 10 | NORMAL | 各 channel 量级接近 |
 | | 10 ~ 1000 | SPIKE | 存在少数异常 channel |
 | | > 1000 | SEVERE | 极端通道不平衡 |
-| `spike_channel_count` | 0 ~ 5 | NORMAL | 典型 spike pattern |
+| `massive_act_channel_count` | 0 ~ 5 | NORMAL | 典型 spike pattern |
 | | > 10 | WARNING | 异常 channel 过多 |
 | `post_norm_sparsity` | < 0.5 | NORMAL | 归一化后信息丰富 |
 | | > 0.8 | HIGH | 高度稀疏，implicit parameter 效应 |
@@ -190,10 +190,10 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 
 ```python
 # 全量监控（< 32 层的模型）
-setup_spike_monitor(model, monitor_interval=10)
+setup_massive_activation_monitor(model, monitor_interval=10)
 
 # 采样监控（大模型，如 64+ 层）— 只看首、中、尾层
-setup_spike_monitor(
+setup_massive_activation_monitor(
     model,
     sample_layers=[0, 1, 2, 3, 16, 30, 31],  # step-up 区 + 中间 + step-down 区
     monitor_interval=10,
@@ -212,7 +212,7 @@ from internal_medicine import setup_internal_medicine
 monitor_dict = {}
 model = setup_internal_medicine(
     model,
-    monitors=['spike_health'],      # 或 'all' 启用全部
+    monitors=['massive_act'],      # 或 'all' 启用全部
     monitor_dict=monitor_dict,
     monitor_interval=10,
 )
@@ -224,20 +224,20 @@ model = setup_internal_medicine(
 from internal_medicine import training_logs
 
 # 获取所有 spike 指标
-spike_metrics = training_logs.get_latest(prefix='spike_health')
+spike_metrics = training_logs.get_latest(prefix='massive_act')
 
 # 查看特定层
-layer_4_max = training_logs.get_latest(prefix='spike_health/layer_4')
+layer_4_max = training_logs.get_latest(prefix='massive_act/layer_4')
 
 # 格式化打印
-training_logs.print_metrics(prefix='spike_health')
+training_logs.print_metrics(prefix='massive_act')
 ```
 
 ### 定位 Step-Up/Step-Down Blocks
 
 ```python
 # 在全部层上运行一次，检查 channel_max 的 layer profile
-spike_metrics = training_logs.get_latest(prefix='spike_health')
+spike_metrics = training_logs.get_latest(prefix='massive_act')
 
 # 找到 channel_max 突增的层 = step-up block
 # 找到 channel_max 突降的层 = step-down block

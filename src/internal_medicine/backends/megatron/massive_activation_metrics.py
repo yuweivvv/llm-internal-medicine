@@ -8,7 +8,7 @@ Anatomy of Massive Activations and Attention Sinks" (arXiv:2603.05498).
 Core metrics:
 1. Channel Max — absolute maximum activation across all channels
 2. Channel Max Ratio — ratio of max channel to median channel (outlier severity)
-3. Spike Channel Count — number of channels exceeding a magnitude threshold
+3. Massive Activation Channel Count — number of channels exceeding a magnitude threshold
 4. Top-K Channel Norm — L2 norm of the top-K largest channels
 5. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm (sparsification)
 6. Post-Norm Cosine Stability — cosine similarity of normalized representations

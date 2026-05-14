@@ -262,7 +262,6 @@ def setup_moe_monitor(
     monitor_interval=1,
     verbose=False,
     monitor_dict=None,
-    return_monitor=False,
 ):
     monitor = MoESpecialistMonitor(
         log_per_layer=log_per_layer,
@@ -276,6 +275,4 @@ def setup_moe_monitor(
     logger.info(f"[MoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["moe_health"] = monitor
-    if return_monitor:
-        return model, monitor
     return model

@@ -4,10 +4,15 @@ MoE Monitor for PaddleFleet.
 Monitors MoE router health and expert weight norms using paddle hooks.
 
 PaddleFleet MoE structure:
-- MoELayer.gate (TopKRouter) — returns 8-tuple:
-    (capacity, topk_weights, topk_indices, gates_masked, mask, priorities, aux_loss, z_loss)
+- MoELayer.gate — varies by model:
+    Qwen3MoeGate: (capacity, combine_weights, dispatch_mask, exp_counts, l_aux, l_zloss)
+    Other gates may return different formats.
 - MoELayer.experts (nn.LayerList) or .grouped_gemm_experts (GroupedMLPExpert)
 - MoELayer.shared_experts (StandardMLPSharedExpert or None)
+
+TODO: Gate output format is model-specific. When switching to a different model
+family, verify that _extract_gate_outputs() parses the tuple correctly.
+Currently adapted for Qwen3MoeGate (PaddleFormers).
 """
 
 import logging
@@ -47,6 +52,8 @@ class PaddleMoEMonitor(BaseMonitor):
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.pp_rank = 0
+        self._global_accum = {}
+        self._global_count = 0
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -160,29 +167,23 @@ class PaddleMoEMonitor(BaseMonitor):
         return hook_fn
 
     def _compute_gate_metrics(self, layer_idx, gate, outputs, moe_layer):
-        """
-        PaddleFleet TopKRouter.forward returns:
-        (capacity, topk_weights, topk_indices, gates_masked, mask, priorities, aux_loss, z_loss)
+        """Compute router metrics from gate forward output.
+
+        TODO: Gate output tuple format is model-specific. When switching model
+        family, check _extract_gate_outputs() and adapt the unpacking logic.
         """
         metrics = {}
 
-        # outputs is the 8-tuple from TopKRouter
-        if isinstance(outputs, tuple) and len(outputs) >= 5:
-            _, topk_weights, _, gates_masked, _ = outputs[:5]
+        topk_weights, router_probs = self._extract_gate_outputs(gate, outputs)
 
-            # Router entropy from gates_masked (non-zero entries form the prob distribution)
-            if gates_masked is not None:
-                # Normalize to probability distribution for entropy
-                row_sum = gates_masked.sum(axis=-1, keepdim=True).clip(min=1e-10)
-                probs = gates_masked / row_sum
-                metrics["router_entropy"] = _compute_router_entropy(probs)
+        if router_probs is not None:
+            metrics["router_entropy"] = _compute_router_entropy(router_probs)
 
-            # TopK score sum
-            if topk_weights is not None:
-                score_sum = topk_weights.sum(axis=-1) if topk_weights.ndim > 1 else topk_weights
-                metrics["score_sum_mean"] = float(score_sum.mean())
-                metrics["score_sum_min"] = float(score_sum.min())
-                metrics["score_sum_max"] = float(score_sum.max())
+        if topk_weights is not None:
+            score_sum = topk_weights.sum(axis=-1) if topk_weights.ndim > 1 else topk_weights
+            metrics["score_sum_mean"] = float(score_sum.mean())
+            metrics["score_sum_min"] = float(score_sum.min())
+            metrics["score_sum_max"] = float(score_sum.max())
 
         # Expert bias (e_score_correction_bias for noaux_tc)
         if hasattr(gate, "e_score_correction_bias"):
@@ -196,9 +197,63 @@ class PaddleMoEMonitor(BaseMonitor):
                 log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
         if self.log_global:
             for name, val in metrics.items():
-                log_dict[f"moe_health/global_{name}"] = val
+                if "max" in name or "std" in name:
+                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+                else:
+                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+            self._global_count += 1
         if log_dict:
             training_logs.update(**log_dict)
+
+    def _extract_gate_outputs(self, gate, outputs):
+        """Extract topk_weights and router_probs from gate forward output.
+
+        TODO: This parsing is model-specific. Current implementation handles:
+        - Qwen3MoeGate 6-tuple: (capacity, combine_weights, dispatch_mask, exp_counts, l_aux, l_zloss)
+          We recompute topk_weights from gate's internal state (top_gate cached during forward).
+        - Fallback: read _scores_for_aux_loss / last_scores if available on gate.
+
+        When adapting to a new model, add a branch here or verify the tuple layout.
+        """
+        topk_weights = None
+        router_probs = None
+
+        # Strategy 1: gate exposes cached scores (preferred when available)
+        if hasattr(gate, "_scores_for_aux_loss") and gate._scores_for_aux_loss is not None:
+            router_probs = gate._scores_for_aux_loss
+            topk = getattr(gate, "top_k", getattr(gate, "topk", None))
+            if topk is not None and router_probs.ndim == 2:
+                topk_vals, _ = paddle.topk(router_probs, topk, axis=-1)
+                topk_weights = topk_vals
+            return topk_weights, router_probs
+
+        # Strategy 2: Qwen3MoeGate 6-tuple — reconstruct from combine_weights
+        if hasattr(gate, "weight") and hasattr(gate, "top_k"):
+            if isinstance(outputs, tuple) and len(outputs) >= 6:
+                combine_weights = outputs[1]
+                if hasattr(combine_weights, 'ndim') and combine_weights.ndim == 3:
+                    # [tokens, experts, capacity] -> [tokens, experts]
+                    per_token_expert = combine_weights.sum(axis=-1)
+                    topk = gate.top_k
+                    topk_weights, _ = paddle.topk(per_token_expert, topk, axis=-1)
+                elif hasattr(combine_weights, 'ndim') and combine_weights.ndim == 2:
+                    topk_weights = combine_weights
+
+                if topk_weights is not None:
+                    row_sum = topk_weights.sum(axis=-1, keepdim=True).clip(min=1e-10)
+                    router_probs = topk_weights / row_sum
+            return topk_weights, router_probs
+
+        # Strategy 3: legacy tuple format fallback
+        if isinstance(outputs, tuple) and len(outputs) >= 5:
+            _, topk_w, _, gates_masked, _ = outputs[:5]
+            if gates_masked is not None and hasattr(gates_masked, 'ndim') and gates_masked.ndim == 2:
+                row_sum = gates_masked.sum(axis=-1, keepdim=True).clip(min=1e-10)
+                router_probs = gates_masked / row_sum
+            if topk_w is not None and hasattr(topk_w, 'ndim'):
+                topk_weights = topk_w
+
+        return topk_weights, router_probs
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
@@ -249,9 +304,31 @@ class PaddleMoEMonitor(BaseMonitor):
                 log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
         if self.log_global:
             for name, val in metrics.items():
-                log_dict[f"moe_health/global_{name}"] = val
+                if "max" in name or "std" in name:
+                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
+                else:
+                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+            self._global_count += 1
         if log_dict:
             training_logs.update(**log_dict)
+
+    def _flush_global_metrics(self):
+        if self._global_count == 0:
+            return
+        log_dict = {}
+        for name, val in self._global_accum.items():
+            if "max" in name or "std" in name:
+                log_dict[f"moe_health/global_{name}"] = val
+            else:
+                log_dict[f"moe_health/global_{name}"] = val / self._global_count
+        training_logs.update(**log_dict)
+        self._global_accum = {}
+        self._global_count = 0
+
+    def step(self):
+        super().step()
+        if self.log_global:
+            self._flush_global_metrics()
 
 
 def setup_moe_monitor(
