@@ -9,8 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...core.base_monitor import BaseMonitor
-from ...core.training_logs import training_logs
+from ...core.base_monitor import Probe
 from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats
 
@@ -20,7 +19,10 @@ logger = logging.getLogger(__name__)
 _MAX_SEQ_LEN_FOR_QK = 8192
 
 
-class QKStatsMonitor(BaseMonitor):
+class QKStatsMonitor(Probe):
+    METRIC_PREFIX = "qk_stats"
+    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
+
     def __init__(
         self,
         causal: bool = True,
@@ -40,10 +42,7 @@ class QKStatsMonitor(BaseMonitor):
         self.compute_count = 0
         self.tp_size = 1
         self.tp_rank = 0
-        self.pp_rank = 0
         self.tp_group = None
-        self._global_accum = {}
-        self._global_count = 0
 
     def register_hooks(self, model: nn.Module):
         try:
@@ -134,20 +133,6 @@ class QKStatsMonitor(BaseMonitor):
             "sink_per_head": full_sink,
         }
 
-    def _flush_global_metrics(self):
-        """Aggregate accumulated per-layer metrics into global metrics."""
-        if self._global_count == 0:
-            return
-        log_dict = {}
-        for name, val in self._global_accum.items():
-            if "max" in name:
-                log_dict[f"qk_stats/global_{name}"] = val
-            else:
-                log_dict[f"qk_stats/global_{name}"] = val / self._global_count
-        training_logs.update(**log_dict)
-        self._global_accum = {}
-        self._global_count = 0
-
     def _make_compute_hook(self, layer_idx: int):
         def hook_fn(module, args):
             if not torch.is_grad_enabled():
@@ -157,7 +142,6 @@ class QKStatsMonitor(BaseMonitor):
             try:
                 query, key = args[0].detach(), args[1].detach()
                 if query.dim() == 3:
-                    # THD format [T, H, D] → SBHD [S, B, H, D] with B=1
                     query = query.unsqueeze(1)
                     key = key.unsqueeze(1)
                 seq_len = query.shape[0] if query.dim() == 4 and query.shape[1] == 1 else query.shape[-2]
@@ -171,12 +155,9 @@ class QKStatsMonitor(BaseMonitor):
                     stats["entropy_per_head_tensor"] = stats["entropy_per_head"].mean(dim=0)
 
                 all_heads = stats["entropy_per_head_tensor"]
-                # Sink head classification (Sun et al. 2026, arXiv:2603.05498)
                 sink_per_head = stats["sink_per_head"]
                 sink_for_classify = sink_per_head.mean(dim=0) if sink_per_head.dim() > 1 else sink_per_head
-                sink_class = compute_sink_head_classification(
-                    sink_for_classify, threshold=self.sink_head_threshold
-                )
+                sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
 
                 metrics = {
                     "max": stats["max_global"],
@@ -190,30 +171,12 @@ class QKStatsMonitor(BaseMonitor):
                     "sink_head_max": sink_class["sink_head_max"].item(),
                     "sink_nonsink_gap": sink_class["sink_nonsink_gap"].item(),
                 }
-                log_dict = {}
-                if self.log_per_layer:
-                    for name, val in metrics.items():
-                        log_dict[f"qk_stats/layer_{layer_idx}/{name}"] = val
-                if self.log_global:
-                    for name, val in metrics.items():
-                        if "max" in name:
-                            self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
-                        else:
-                            self._global_accum[name] = self._global_accum.get(name, 0.0) + val
-                    self._global_count += 1
-                if log_dict:
-                    training_logs.update(**log_dict)
+                self._record_metrics(layer_idx, metrics)
                 self.compute_count += 1
             except Exception as e:
                 logger.error(f"[QKMonitor] Error layer {layer_idx}: {e}")
 
         return hook_fn
-
-    def step(self):
-        """Tick step counter and flush global metrics."""
-        super().step()
-        if self.log_global:
-            self._flush_global_metrics()
 
 
 def setup_qk_monitor(

@@ -20,7 +20,7 @@ import logging
 import paddle
 import paddle.nn as nn
 
-from ...core.base_monitor import BaseMonitor
+from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
 
 logger = logging.getLogger(__name__)
@@ -46,14 +46,14 @@ def _compute_expert_norms_paddle(weight_list):
     }
 
 
-class PaddleMoEMonitor(BaseMonitor):
+class PaddleMoEMonitor(Probe):
+    METRIC_PREFIX = "moe_health"
+    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
+
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
-        self.pp_rank = 0
-        self._global_accum = {}
-        self._global_count = 0
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -71,11 +71,9 @@ class PaddleMoEMonitor(BaseMonitor):
             logger.info(f"[PaddleMoEMonitor] Found {len(moe_layers)} MoE layers.")
 
         for layer_idx, moe_layer in moe_layers:
-            # Hook on gate (TopKRouter)
             if hasattr(moe_layer, "gate"):
                 hook = moe_layer.gate.register_forward_post_hook(self._make_gate_hook(layer_idx, moe_layer))
                 self.hooks.append(hook)
-            # Hook on MoELayer for expert norms
             hook = moe_layer.register_forward_post_hook(self._make_moe_layer_hook(layer_idx, moe_layer))
             self.hooks.append(hook)
 
@@ -85,7 +83,6 @@ class PaddleMoEMonitor(BaseMonitor):
         moe_layers = []
         layers = self._get_decoder_layers(model)
         if layers is None:
-            # Fallback: search all sublayers
             for _name, sublayer in model.named_sublayers():
                 if sublayer.__class__.__name__ == "MoELayer":
                     moe_layers.append((len(moe_layers), sublayer))
@@ -94,7 +91,6 @@ class PaddleMoEMonitor(BaseMonitor):
         for local_idx, layer in enumerate(layers):
             global_idx = self.pp_rank * len(layers) + local_idx
             moe_module = None
-            # PaddleFleet: TransformerLayer.mlp can be MoELayer
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
                 moe_module = layer.mlp
             elif hasattr(layer, "moe"):
@@ -167,11 +163,7 @@ class PaddleMoEMonitor(BaseMonitor):
         return hook_fn
 
     def _compute_gate_metrics(self, layer_idx, gate, outputs, moe_layer):
-        """Compute router metrics from gate forward output.
-
-        TODO: Gate output tuple format is model-specific. When switching model
-        family, check _extract_gate_outputs() and adapt the unpacking logic.
-        """
+        """Compute router metrics from gate forward output."""
         metrics = {}
 
         topk_weights, router_probs = self._extract_gate_outputs(gate, outputs)
@@ -185,25 +177,16 @@ class PaddleMoEMonitor(BaseMonitor):
             metrics["score_sum_min"] = float(score_sum.min())
             metrics["score_sum_max"] = float(score_sum.max())
 
-        # Expert bias (e_score_correction_bias for noaux_tc)
         if hasattr(gate, "e_score_correction_bias"):
             bias = gate.e_score_correction_bias
             metrics["expert_bias_mean"] = float(bias.mean())
             metrics["expert_bias_std"] = float(bias.std())
 
-        log_dict = {}
-        if self.log_per_layer:
-            for name, val in metrics.items():
-                log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
+        # Per-layer log + global accumulate (no count increment — expert hook does that)
+        if self.log_per_layer and metrics:
+            training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
         if self.log_global:
-            for name, val in metrics.items():
-                if "max" in name or "std" in name:
-                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
-                else:
-                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
-            self._global_count += 1
-        if log_dict:
-            training_logs.update(**log_dict)
+            self._accumulate_global(metrics)
 
     def _extract_gate_outputs(self, gate, outputs):
         """Extract topk_weights and router_probs from gate forward output.
@@ -218,7 +201,6 @@ class PaddleMoEMonitor(BaseMonitor):
         topk_weights = None
         router_probs = None
 
-        # Strategy 1: gate exposes cached scores (preferred when available)
         if hasattr(gate, "_scores_for_aux_loss") and gate._scores_for_aux_loss is not None:
             router_probs = gate._scores_for_aux_loss
             topk = getattr(gate, "top_k", getattr(gate, "topk", None))
@@ -227,16 +209,14 @@ class PaddleMoEMonitor(BaseMonitor):
                 topk_weights = topk_vals
             return topk_weights, router_probs
 
-        # Strategy 2: Qwen3MoeGate 6-tuple — reconstruct from combine_weights
         if hasattr(gate, "weight") and hasattr(gate, "top_k"):
             if isinstance(outputs, tuple) and len(outputs) >= 6:
                 combine_weights = outputs[1]
-                if hasattr(combine_weights, 'ndim') and combine_weights.ndim == 3:
-                    # [tokens, experts, capacity] -> [tokens, experts]
+                if hasattr(combine_weights, "ndim") and combine_weights.ndim == 3:
                     per_token_expert = combine_weights.sum(axis=-1)
                     topk = gate.top_k
                     topk_weights, _ = paddle.topk(per_token_expert, topk, axis=-1)
-                elif hasattr(combine_weights, 'ndim') and combine_weights.ndim == 2:
+                elif hasattr(combine_weights, "ndim") and combine_weights.ndim == 2:
                     topk_weights = combine_weights
 
                 if topk_weights is not None:
@@ -244,13 +224,12 @@ class PaddleMoEMonitor(BaseMonitor):
                     router_probs = topk_weights / row_sum
             return topk_weights, router_probs
 
-        # Strategy 3: legacy tuple format fallback
         if isinstance(outputs, tuple) and len(outputs) >= 5:
             _, topk_w, _, gates_masked, _ = outputs[:5]
-            if gates_masked is not None and hasattr(gates_masked, 'ndim') and gates_masked.ndim == 2:
+            if gates_masked is not None and hasattr(gates_masked, "ndim") and gates_masked.ndim == 2:
                 row_sum = gates_masked.sum(axis=-1, keepdim=True).clip(min=1e-10)
                 router_probs = gates_masked / row_sum
-            if topk_w is not None and hasattr(topk_w, 'ndim'):
+            if topk_w is not None and hasattr(topk_w, "ndim"):
                 topk_weights = topk_w
 
         return topk_weights, router_probs
@@ -259,12 +238,10 @@ class PaddleMoEMonitor(BaseMonitor):
         metrics = {}
         routed_norm_mean = None
 
-        # Expert norms — handle both grouped_gemm and standard experts
         if hasattr(moe_layer, "grouped_gemm_experts") and moe_layer.grouped_gemm_experts is not None:
             ggm = moe_layer.grouped_gemm_experts
             expert_weights = []
             if hasattr(ggm, "weight1") and hasattr(ggm, "weight2"):
-                # GroupedMLPExpert: weight1 [E, H, F], weight2 [E, F, H]
                 w1 = ggm.weight1
                 w2 = ggm.weight2
                 num_experts = w1.shape[0]
@@ -288,7 +265,6 @@ class PaddleMoEMonitor(BaseMonitor):
                 metrics.update(norm_stats)
                 routed_norm_mean = norm_stats["expert_norm_mean"]
 
-        # Shared expert norms
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
             shared_weights = [p.flatten() for p in moe_layer.shared_experts.parameters()]
             if shared_weights:
@@ -298,37 +274,8 @@ class PaddleMoEMonitor(BaseMonitor):
                 if routed_norm_mean is not None and routed_norm_mean > 1e-8:
                     metrics["shared_routed_ratio"] = shared_norm / routed_norm_mean
 
-        log_dict = {}
-        if self.log_per_layer:
-            for name, val in metrics.items():
-                log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
-        if self.log_global:
-            for name, val in metrics.items():
-                if "max" in name or "std" in name:
-                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
-                else:
-                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
-            self._global_count += 1
-        if log_dict:
-            training_logs.update(**log_dict)
-
-    def _flush_global_metrics(self):
-        if self._global_count == 0:
-            return
-        log_dict = {}
-        for name, val in self._global_accum.items():
-            if "max" in name or "std" in name:
-                log_dict[f"moe_health/global_{name}"] = val
-            else:
-                log_dict[f"moe_health/global_{name}"] = val / self._global_count
-        training_logs.update(**log_dict)
-        self._global_accum = {}
-        self._global_count = 0
-
-    def step(self):
-        super().step()
-        if self.log_global:
-            self._flush_global_metrics()
+        # _record_metrics handles per-layer log + global accumulate + count++
+        self._record_metrics(layer_idx, metrics)
 
 
 def setup_moe_monitor(

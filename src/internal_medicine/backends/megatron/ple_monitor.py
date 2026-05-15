@@ -8,7 +8,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from ...core.base_monitor import BaseMonitor
+from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
 from .ple_metrics import (
     compute_branch_cosine,
@@ -20,7 +20,7 @@ from .ple_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class PLEHealthMonitor(BaseMonitor):
+class PLEHealthMonitor(Probe):
     def __init__(
         self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, gate_sparsity_threshold=0.01
     ):

@@ -10,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...core.base_monitor import BaseMonitor
+from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
@@ -24,14 +24,15 @@ from .moe_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class MoESpecialistMonitor(BaseMonitor):
+class MoESpecialistMonitor(Probe):
+    METRIC_PREFIX = "moe_health"
+    MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
+
     def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.moe_layers: list[weakref.ref] = []
-        self._global_accum = {}
-        self._global_count = 0
 
     def register_hooks(self, model: nn.Module):
         try:
@@ -148,19 +149,11 @@ class MoESpecialistMonitor(BaseMonitor):
                 jaccard = compute_bias_affinity_jaccard(routing_before, routing_after)
                 metrics["bias_affinity_jaccard"] = jaccard.item()
 
-        log_dict = {}
-        if self.log_per_layer:
-            for name, val in metrics.items():
-                log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
+        # Per-layer log + global accumulate (no count increment — expert hook does that)
+        if self.log_per_layer and metrics:
+            training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
         if self.log_global:
-            for name, val in metrics.items():
-                if "max" in name or "std" in name:
-                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
-                else:
-                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
-            self._global_count += 1
-        if log_dict:
-            training_logs.update(**log_dict)
+            self._accumulate_global(metrics)
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
@@ -208,37 +201,8 @@ class MoESpecialistMonitor(BaseMonitor):
                     ratio = compute_shared_routed_ratio(shared_norm, routed_norm_mean.clone().detach())
                     metrics["shared_routed_ratio"] = ratio.item()
 
-        log_dict = {}
-        if self.log_per_layer:
-            for name, val in metrics.items():
-                log_dict[f"moe_health/layer_{layer_idx}/{name}"] = val
-        if self.log_global:
-            for name, val in metrics.items():
-                if "max" in name or "std" in name or "norm_std" in name:
-                    self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
-                else:
-                    self._global_accum[name] = self._global_accum.get(name, 0.0) + val
-            self._global_count += 1
-        if log_dict:
-            training_logs.update(**log_dict)
-
-    def _flush_global_metrics(self):
-        if self._global_count == 0:
-            return
-        log_dict = {}
-        for name, val in self._global_accum.items():
-            if "max" in name or "std" in name or "norm_std" in name:
-                log_dict[f"moe_health/global_{name}"] = val
-            else:
-                log_dict[f"moe_health/global_{name}"] = val / self._global_count
-        training_logs.update(**log_dict)
-        self._global_accum = {}
-        self._global_count = 0
-
-    def step(self):
-        super().step()
-        if self.log_global:
-            self._flush_global_metrics()
+        # _record_metrics handles per-layer log + global accumulate + count++
+        self._record_metrics(layer_idx, metrics)
 
     def remove_hooks(self):
         super().remove_hooks()

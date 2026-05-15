@@ -10,7 +10,7 @@ import logging
 import paddle
 import paddle.nn as nn
 
-from ...core.base_monitor import BaseMonitor
+from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = T
     return _compute_qk_stats_triton(q, k, causal)
 
 
-class PaddleQKStatsMonitor(BaseMonitor):
+class PaddleQKStatsMonitor(Probe):
     def __init__(self, causal=True, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
