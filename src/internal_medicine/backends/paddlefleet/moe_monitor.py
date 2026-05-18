@@ -5,14 +5,14 @@ Monitors MoE router health and expert weight norms using paddle hooks.
 
 PaddleFleet MoE structure:
 - MoELayer.gate — varies by model:
-    Qwen3MoeGate: (capacity, combine_weights, dispatch_mask, exp_counts, l_aux, l_zloss)
+    StandardMoEGate: (capacity, top_gate, top_idx, gates_masked, mask, token_priority, l_aux, l_zloss)
     Other gates may return different formats.
 - MoELayer.experts (nn.LayerList) or .grouped_gemm_experts (GroupedMLPExpert)
 - MoELayer.shared_experts (StandardMLPSharedExpert or None)
 
 TODO: Gate output format is model-specific. When switching to a different model
-family, verify that _extract_gate_outputs() parses the tuple correctly.
-Currently adapted for Qwen3MoeGate (PaddleFormers).
+family, verify that outputs[2] (top_idx) is still at index 2 in the gate's
+return tuple. Currently adapted for StandardMoEGate (PaddleFormers).
 """
 
 import logging
@@ -29,8 +29,50 @@ logger = logging.getLogger(__name__)
 def _compute_router_entropy(probs):
     """Router entropy from probability distribution. probs: [tokens, experts]."""
     probs = probs.astype("float32").clip(min=1e-10)
+    probs = probs / probs.sum(axis=-1, keepdim=True)
     entropy = -(probs * probs.log()).sum(axis=-1)
     return float(entropy.mean())
+
+
+def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=1, topk_group=1):
+    """Compute mean Jaccard similarity between routing with and without correction_bias.
+
+    Paddle port of megatron/moe_metrics.compute_bias_affinity_jaccard, extended with
+    group-limited topk support for PaddleFleet's TopKRouter.
+
+    Args:
+        top_idx_with_bias: [tokens, k] — actual routing indices (with bias)
+        gates_no_bias: [tokens, experts] — original gate scores (no bias)
+        k: num_experts_per_tok
+        n_group / topk_group: group-limited topk params
+
+    Returns:
+        mean Jaccard similarity (1 = identical routing, 0 = completely different)
+    """
+    num_tokens, num_experts = gates_no_bias.shape
+
+    if n_group > 1 and topk_group > 1:
+        group_size = num_experts // n_group
+        gates_reshaped = gates_no_bias.reshape([num_tokens, n_group, group_size])
+        group_max = gates_reshaped.max(axis=-1)
+        _, top_groups = paddle.topk(group_max, topk_group, axis=-1)
+        group_mask = paddle.zeros([num_tokens, n_group], dtype="int32")
+        group_mask = group_mask.put_along_axis(top_groups, paddle.to_tensor(1, dtype="int32"), axis=1)
+        group_mask = group_mask.unsqueeze(-1).expand([-1, -1, group_size]).reshape([num_tokens, num_experts])
+        masked_gates = gates_no_bias.clone()
+        masked_gates = paddle.where(group_mask > 0, masked_gates, paddle.full_like(masked_gates, float("-inf")))
+        _, top_idx_no_bias = paddle.topk(masked_gates, k, axis=-1)
+    else:
+        _, top_idx_no_bias = paddle.topk(gates_no_bias, k, axis=-1)
+
+    set_with = paddle.zeros([num_tokens, num_experts], dtype="int32")
+    set_without = paddle.zeros([num_tokens, num_experts], dtype="int32")
+    set_with = set_with.put_along_axis(top_idx_with_bias, paddle.to_tensor(1, dtype="int32"), axis=1)
+    set_without = set_without.put_along_axis(top_idx_no_bias, paddle.to_tensor(1, dtype="int32"), axis=1)
+
+    intersection = (set_with & set_without).astype("float32").sum()
+    union = (set_with | set_without).astype("float32").sum()
+    return float(intersection / union.clip(min=1.0))
 
 
 def _compute_expert_norms_paddle(weight_list):
@@ -72,12 +114,28 @@ class PaddleMoEMonitor(Probe):
 
         for layer_idx, moe_layer in moe_layers:
             if hasattr(moe_layer, "gate"):
+                self._patch_gate_cache(moe_layer.gate)
                 hook = moe_layer.gate.register_forward_post_hook(self._make_gate_hook(layer_idx, moe_layer))
                 self.hooks.append(hook)
             hook = moe_layer.register_forward_post_hook(self._make_moe_layer_hook(layer_idx, moe_layer))
             self.hooks.append(hook)
 
         logger.info(f"[PaddleMoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
+
+    @staticmethod
+    def _patch_gate_cache(gate):
+        """Monkey-patch gate.gate_score_func to cache pre-bias gates."""
+        if hasattr(gate, "_im_patched"):
+            return
+        original_fn = gate.gate_score_func
+
+        def cached_gate_score_func(logits):
+            result = original_fn(logits)
+            gate._cached_gates = result.detach()
+            return result
+
+        gate.gate_score_func = cached_gate_score_func
+        gate._im_patched = True
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
         moe_layers = []
@@ -166,73 +224,40 @@ class PaddleMoEMonitor(Probe):
         """Compute router metrics from gate forward output."""
         metrics = {}
 
-        topk_weights, router_probs = self._extract_gate_outputs(gate, outputs)
+        # Use _cached_gates (patched softmax output, pre-bias) as the canonical probability distribution
+        cached_gates = getattr(gate, "_cached_gates", None)
+        k = getattr(gate, "num_experts_per_tok", None)
 
-        if router_probs is not None:
-            metrics["router_entropy"] = _compute_router_entropy(router_probs)
+        if cached_gates is not None:
+            metrics["router_entropy"] = _compute_router_entropy(cached_gates)
+            if k is not None:
+                topk_vals, _ = paddle.topk(cached_gates, k, axis=-1)
+                score_sum = topk_vals.sum(axis=-1)
+                metrics["score_sum_mean"] = float(score_sum.mean())
+                metrics["score_sum_min"] = float(score_sum.min())
+                metrics["score_sum_max"] = float(score_sum.max())
 
-        if topk_weights is not None:
-            score_sum = topk_weights.sum(axis=-1) if topk_weights.ndim > 1 else topk_weights
-            metrics["score_sum_mean"] = float(score_sum.mean())
-            metrics["score_sum_min"] = float(score_sum.min())
-            metrics["score_sum_max"] = float(score_sum.max())
-
-        if hasattr(gate, "e_score_correction_bias"):
+        if hasattr(gate, "e_score_correction_bias") and cached_gates is not None:
+            top_idx_with_bias = None
+            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                top_idx_with_bias = outputs[2]
+            if top_idx_with_bias is not None and k is not None:
+                n_group = getattr(gate, "n_group", 1)
+                topk_group = getattr(gate, "topk_group", 1)
+                metrics["bias_affinity_jaccard"] = _compute_bias_affinity_jaccard(
+                    top_idx_with_bias, cached_gates, k, n_group, topk_group
+                )
             bias = gate.e_score_correction_bias
             metrics["expert_bias_mean"] = float(bias.mean())
             metrics["expert_bias_std"] = float(bias.std())
+            metrics["expert_bias_max"] = float(bias.max())
+            metrics["expert_bias_min"] = float(bias.min())
 
         # Per-layer log + global accumulate (no count increment — expert hook does that)
         if self.log_per_layer and metrics:
             training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
         if self.log_global:
             self._accumulate_global(metrics)
-
-    def _extract_gate_outputs(self, gate, outputs):
-        """Extract topk_weights and router_probs from gate forward output.
-
-        TODO: This parsing is model-specific. Current implementation handles:
-        - Qwen3MoeGate 6-tuple: (capacity, combine_weights, dispatch_mask, exp_counts, l_aux, l_zloss)
-          We recompute topk_weights from gate's internal state (top_gate cached during forward).
-        - Fallback: read _scores_for_aux_loss / last_scores if available on gate.
-
-        When adapting to a new model, add a branch here or verify the tuple layout.
-        """
-        topk_weights = None
-        router_probs = None
-
-        if hasattr(gate, "_scores_for_aux_loss") and gate._scores_for_aux_loss is not None:
-            router_probs = gate._scores_for_aux_loss
-            topk = getattr(gate, "top_k", getattr(gate, "topk", None))
-            if topk is not None and router_probs.ndim == 2:
-                topk_vals, _ = paddle.topk(router_probs, topk, axis=-1)
-                topk_weights = topk_vals
-            return topk_weights, router_probs
-
-        if hasattr(gate, "weight") and hasattr(gate, "top_k"):
-            if isinstance(outputs, tuple) and len(outputs) >= 6:
-                combine_weights = outputs[1]
-                if hasattr(combine_weights, "ndim") and combine_weights.ndim == 3:
-                    per_token_expert = combine_weights.sum(axis=-1)
-                    topk = gate.top_k
-                    topk_weights, _ = paddle.topk(per_token_expert, topk, axis=-1)
-                elif hasattr(combine_weights, "ndim") and combine_weights.ndim == 2:
-                    topk_weights = combine_weights
-
-                if topk_weights is not None:
-                    row_sum = topk_weights.sum(axis=-1, keepdim=True).clip(min=1e-10)
-                    router_probs = topk_weights / row_sum
-            return topk_weights, router_probs
-
-        if isinstance(outputs, tuple) and len(outputs) >= 5:
-            _, topk_w, _, gates_masked, _ = outputs[:5]
-            if gates_masked is not None and hasattr(gates_masked, "ndim") and gates_masked.ndim == 2:
-                row_sum = gates_masked.sum(axis=-1, keepdim=True).clip(min=1e-10)
-                router_probs = gates_masked / row_sum
-            if topk_w is not None and hasattr(topk_w, "ndim"):
-                topk_weights = topk_w
-
-        return topk_weights, router_probs
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
