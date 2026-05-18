@@ -53,12 +53,33 @@ class MoESpecialistMonitor(Probe):
         for layer_idx, moe_layer in moe_layers:
             self.moe_layers.append(weakref.ref(moe_layer))
             if hasattr(moe_layer, "router"):
+                self._patch_router_cache(moe_layer.router)
                 hook = moe_layer.router.register_forward_hook(self._make_router_hook(layer_idx, moe_layer))
                 self.hooks.append(hook)
             hook = moe_layer.register_forward_hook(self._make_moe_layer_hook(layer_idx, moe_layer))
             self.hooks.append(hook)
 
         logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
+
+    @staticmethod
+    def _patch_router_cache(router):
+        """Monkey-patch router._apply_aux_loss to intercept scores_for_aux_loss.
+
+        Inside routing(), compute_routing_scores_for_aux_loss is already called
+        and the result is passed to _apply_aux_loss. We intercept there to cache
+        the data with zero additional compute (just detach).
+        """
+        if getattr(router, "_im_patched", False):
+            return
+        original_apply = router._apply_aux_loss
+
+        def patched_apply(probs, scores_for_aux_loss, routing_map, *args, **kwargs):
+            router._cached_scores_for_aux_loss = scores_for_aux_loss.detach()
+            router._cached_routing_map_for_aux_loss = routing_map.detach()
+            return original_apply(probs, scores_for_aux_loss, routing_map, *args, **kwargs)
+
+        router._apply_aux_loss = patched_apply
+        router._im_patched = True
 
     def _find_moe_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         moe_layers = []
@@ -96,14 +117,14 @@ class MoESpecialistMonitor(Probe):
         return moe_layers
 
     def _make_router_hook(self, layer_idx: int, moe_layer: nn.Module):
-        def hook_fn(module, inputs, outputs):
+        def hook_fn(module, _inputs, outputs):
             if not torch.is_grad_enabled():
                 return
             if not self._should_monitor():
                 return
             try:
                 with torch.no_grad():
-                    self._compute_router_metrics(layer_idx, module, inputs, outputs, moe_layer)
+                    self._compute_router_metrics(layer_idx, module, outputs, moe_layer)
             except Exception as e:
                 if self.verbose:
                     logger.error(f"[MoEMonitor] Router hook error layer {layer_idx}: {e}")
@@ -125,10 +146,10 @@ class MoESpecialistMonitor(Probe):
 
         return hook_fn
 
-    def _compute_router_metrics(self, layer_idx, router, _inputs, outputs, _moe_layer):
+    def _compute_router_metrics(self, layer_idx, router, outputs, _moe_layer):
         metrics = {}
-        scores_for_aux_loss = getattr(router, "_scores_for_aux_loss", None)
         topk = getattr(router, "topk", None)
+        scores_for_aux_loss = getattr(router, "_cached_scores_for_aux_loss", None)
 
         if scores_for_aux_loss is not None:
             metrics["router_entropy"] = compute_router_entropy(scores_for_aux_loss).item()
@@ -142,12 +163,11 @@ class MoESpecialistMonitor(Probe):
             metrics["expert_bias_mean"] = router.expert_bias.mean().item()
             metrics["expert_bias_std"] = router.expert_bias.std().item()
 
-        if hasattr(router, "_routing_map_for_aux_loss") and router._routing_map_for_aux_loss is not None:
-            routing_before = router._routing_map_for_aux_loss
-            if isinstance(outputs, tuple) and len(outputs) >= 2:
-                routing_after = outputs[1]
-                jaccard = compute_bias_affinity_jaccard(routing_before, routing_after)
-                metrics["bias_affinity_jaccard"] = jaccard.item()
+        routing_map_for_aux_loss = getattr(router, "_cached_routing_map_for_aux_loss", None)
+        if routing_map_for_aux_loss is not None and isinstance(outputs, tuple) and len(outputs) >= 2:
+            routing_after = outputs[1]
+            jaccard = compute_bias_affinity_jaccard(routing_map_for_aux_loss, routing_after)
+            metrics["bias_affinity_jaccard"] = jaccard.item()
 
         # Per-layer log + global accumulate (no count increment — expert hook does that)
         if self.log_per_layer and metrics:
