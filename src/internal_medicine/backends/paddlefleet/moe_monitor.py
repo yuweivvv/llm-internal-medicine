@@ -228,16 +228,20 @@ class PaddleMoEMonitor(Probe):
         cached_gates = getattr(gate, "_cached_gates", None)
         k = getattr(gate, "num_experts_per_tok", None)
 
-        if cached_gates is not None:
-            metrics["router_entropy"] = _compute_router_entropy(cached_gates)
-            if k is not None:
-                topk_vals, _ = paddle.topk(cached_gates, k, axis=-1)
-                score_sum = topk_vals.sum(axis=-1)
-                metrics["score_sum_mean"] = float(score_sum.mean())
-                metrics["score_sum_min"] = float(score_sum.min())
-                metrics["score_sum_max"] = float(score_sum.max())
+        if cached_gates is None:
+            if self.verbose:
+                logger.warning(f"[PaddleMoEMonitor] layer {layer_idx}: _cached_gates is None, gate patch may not work")
+            return
 
-        if hasattr(gate, "e_score_correction_bias") and cached_gates is not None:
+        metrics["router_entropy"] = _compute_router_entropy(cached_gates)
+        if k is not None:
+            topk_vals, _ = paddle.topk(cached_gates, k, axis=-1)
+            score_sum = topk_vals.sum(axis=-1)
+            metrics["score_sum_mean"] = float(score_sum.mean())
+            metrics["score_sum_min"] = float(score_sum.min())
+            metrics["score_sum_max"] = float(score_sum.max())
+
+        if hasattr(gate, "e_score_correction_bias"):
             top_idx_with_bias = None
             if isinstance(outputs, tuple) and len(outputs) >= 3:
                 top_idx_with_bias = outputs[2]

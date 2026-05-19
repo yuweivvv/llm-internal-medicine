@@ -3,6 +3,7 @@
 import logging
 
 from .gather import install_gather_fn
+from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
 from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
 from .qk_monitor import PaddleQKStatsMonitor, setup_qk_monitor
 
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 _MONITOR_MAP = {
     "qk_stats": setup_qk_monitor,
     "moe_health": setup_moe_monitor,
+    "massive_act": setup_massive_activation_monitor,
 }
 
 
@@ -50,4 +52,6 @@ __all__ = [
     "setup_qk_monitor",
     "PaddleMoEMonitor",
     "setup_moe_monitor",
+    "PaddleMassiveActivationMonitor",
+    "setup_massive_activation_monitor",
 ]
