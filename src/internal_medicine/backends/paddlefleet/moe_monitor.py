@@ -124,7 +124,7 @@ class PaddleMoEMonitor(Probe):
 
     @staticmethod
     def _patch_gate_cache(gate):
-        """Monkey-patch gate.gate_score_func to cache pre-bias gates."""
+        """Monkey-patch gate.gate_score_func (and _hash_routing if present) to cache pre-bias gates."""
         if hasattr(gate, "_im_patched"):
             return
         original_fn = gate.gate_score_func
@@ -135,6 +135,32 @@ class PaddleMoEMonitor(Probe):
             return result
 
         gate.gate_score_func = cached_gate_score_func
+
+        # Also patch _hash_routing for hash-routed layers (DeepSeek V4+).
+        # Hash layers return early from forward() without calling gate_score_func,
+        # so we intercept _hash_routing to capture the scores computed there.
+        if hasattr(gate, "_hash_routing"):
+            original_hash_routing = gate._hash_routing
+
+            def cached_hash_routing(logits, flat_ids):
+                result = original_hash_routing(logits, flat_ids)
+                # _hash_routing computes scores internally (softmax/sigmoid on logits).
+                # Recompute here to cache the full [N, num_experts] score distribution.
+                import paddle.nn.functional as F
+
+                logits_fp32 = logits.cast("float32")
+                scoring_func = getattr(gate, "scoring_func", "softmax")
+                if scoring_func == "softmax":
+                    scores = F.softmax(logits_fp32, axis=-1)
+                elif scoring_func == "sigmoid":
+                    scores = F.sigmoid(logits_fp32)
+                else:
+                    scores = F.softmax(logits_fp32, axis=-1)
+                gate._cached_gates = scores.detach()
+                return result
+
+            gate._hash_routing = cached_hash_routing
+
         gate._im_patched = True
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
