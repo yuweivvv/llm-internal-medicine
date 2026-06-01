@@ -10,7 +10,7 @@ import logging
 import paddle
 import paddle.nn as nn
 
-from ...core.base_monitor import Probe
+from .base import PaddleProbe
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = T
     return _compute_qk_stats_triton(q, k, causal)
 
 
-class PaddleQKStatsMonitor(Probe):
+class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
     MAX_AGGREGATED = {"max", "entropy_max"}
     MIN_AGGREGATED = {"entropy_min"}

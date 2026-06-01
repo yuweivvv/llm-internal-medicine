@@ -10,8 +10,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
+from .base import TorchProbe
 from .moe_metrics import (
     compute_bias_affinity_jaccard,
     compute_expert_norms,
@@ -24,7 +24,7 @@ from .moe_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class MoESpecialistMonitor(Probe):
+class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
@@ -143,11 +143,6 @@ class MoESpecialistMonitor(Probe):
 
     def _make_router_hook(self, layer_idx: int, moe_layer: nn.Module):
         def hook_fn(module, _inputs, outputs):
-            if not torch.is_grad_enabled():
-                for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
-                    if hasattr(module, attr):
-                        setattr(module, attr, None)
-                return
             if not self._should_monitor():
                 for attr in ("_cached_scores_for_aux_loss", "_cached_routing_map_for_aux_loss"):
                     if hasattr(module, attr):
@@ -168,8 +163,6 @@ class MoESpecialistMonitor(Probe):
 
     def _make_moe_layer_hook(self, layer_idx: int, _moe_layer: nn.Module):
         def hook_fn(module, _inputs, _outputs):
-            if not torch.is_grad_enabled():
-                return
             if not self._should_monitor():
                 return
             try:

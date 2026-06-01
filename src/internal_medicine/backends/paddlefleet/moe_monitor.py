@@ -20,8 +20,8 @@ import logging
 import paddle
 import paddle.nn as nn
 
-from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
+from .base import PaddleProbe
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def _compute_expert_norms_paddle(weight_list):
     }
 
 
-class PaddleMoEMonitor(Probe):
+class PaddleMoEMonitor(PaddleProbe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "expert_bias_max"}
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min", "expert_bias_min"}

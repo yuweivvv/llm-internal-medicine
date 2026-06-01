@@ -35,7 +35,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from ...core.base_monitor import Probe
+from .base import TorchProbe
 from .massive_activation_metrics import (
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
@@ -46,7 +46,7 @@ from .massive_activation_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class MassiveActivationMonitor(Probe):
+class MassiveActivationMonitor(TorchProbe):
     """Monitor massive activations in the residual stream.
 
     Hooks into Transformer layers at two points:
@@ -166,8 +166,6 @@ class MassiveActivationMonitor(Probe):
         """Create a forward pre-hook that captures the residual stream."""
 
         def hook_fn(module, args, kwargs=None):
-            if not torch.is_grad_enabled():
-                return
             if not self._should_monitor():
                 return
             try:

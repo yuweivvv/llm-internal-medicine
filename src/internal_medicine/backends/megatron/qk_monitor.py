@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...core.base_monitor import Probe
+from .base import TorchProbe
 from .sink_head_metrics import compute_sink_head_classification
 from .triton_kernels import compute_qk_stats
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 _MAX_SEQ_LEN_FOR_QK = 8192
 
 
-class QKStatsMonitor(Probe):
+class QKStatsMonitor(TorchProbe):
     METRIC_PREFIX = "qk_stats"
     MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
     MIN_AGGREGATED = {"entropy_min"}
@@ -146,8 +146,6 @@ class QKStatsMonitor(Probe):
 
     def _make_compute_hook(self, layer_idx: int):
         def hook_fn(module, args):
-            if not torch.is_grad_enabled():
-                return
             if not self._should_monitor():
                 return
             try:

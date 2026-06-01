@@ -2,6 +2,7 @@
 
 import logging
 
+from .base import PaddleProbe
 from .gather import install_gather_fn
 from .massive_activation_monitor import PaddleMassiveActivationMonitor, setup_massive_activation_monitor
 from .moe_monitor import PaddleMoEMonitor, setup_moe_monitor
@@ -48,6 +49,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
 
 __all__ = [
     "setup_monitors",
+    "PaddleProbe",
     "PaddleQKStatsMonitor",
     "setup_qk_monitor",
     "PaddleMoEMonitor",

@@ -8,8 +8,8 @@ import logging
 import torch
 import torch.nn as nn
 
-from ...core.base_monitor import Probe
 from ...core.training_logs import training_logs
+from .base import TorchProbe
 from .ple_metrics import (
     compute_branch_cosine,
     compute_branch_norms,
@@ -20,7 +20,7 @@ from .ple_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class PLEHealthMonitor(Probe):
+class PLEHealthMonitor(TorchProbe):
     METRIC_PREFIX = "ple_health"
 
     def __init__(
@@ -108,7 +108,7 @@ class PLEHealthMonitor(Probe):
         H_ple = self._hidden_size_ple
 
         def hook_fn(module, inputs, output):
-            if not torch.is_grad_enabled() or not self._should_monitor():
+            if not self._should_monitor():
                 return
             with torch.no_grad():
                 B, S, _ = output.shape
@@ -121,7 +121,7 @@ class PLEHealthMonitor(Probe):
         H = self._hidden_size
 
         def hook_fn(module, inputs, output):
-            if not torch.is_grad_enabled() or not self._should_monitor():
+            if not self._should_monitor():
                 return
             with torch.no_grad():
                 self._proj_ple_buf = output * (H**-0.5)
@@ -132,7 +132,7 @@ class PLEHealthMonitor(Probe):
         per_layer_input_scale = 2.0**-0.5
 
         def hook_fn(module, inputs, output):
-            if not torch.is_grad_enabled() or not self._should_monitor():
+            if not self._should_monitor():
                 return
             if self._token_ple_buf is None or self._proj_ple_buf is None:
                 return
@@ -158,7 +158,7 @@ class PLEHealthMonitor(Probe):
 
     def _make_gate_hook(self, layer_idx: int):
         def hook_fn(module, inputs, output):
-            if not torch.is_grad_enabled() or not self._should_monitor():
+            if not self._should_monitor():
                 return
             with torch.no_grad():
                 gate_out = output[0] if isinstance(output, tuple) else output
@@ -171,7 +171,7 @@ class PLEHealthMonitor(Probe):
         threshold = self.gate_sparsity_threshold
 
         def hook_fn(module, inputs, output):
-            if not torch.is_grad_enabled() or not self._should_monitor():
+            if not self._should_monitor():
                 return
             try:
                 with torch.no_grad():

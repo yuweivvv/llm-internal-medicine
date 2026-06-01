@@ -29,7 +29,7 @@ import logging
 import paddle
 import paddle.nn as nn
 
-from ...core.base_monitor import Probe
+from .base import PaddleProbe
 from .massive_activation_metrics import (
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
@@ -40,7 +40,7 @@ from .massive_activation_metrics import (
 logger = logging.getLogger(__name__)
 
 
-class PaddleMassiveActivationMonitor(Probe):
+class PaddleMassiveActivationMonitor(PaddleProbe):
     """Monitor massive activations in the residual stream.
 
     Hooks into Transformer layers via forward pre-hooks to capture the
