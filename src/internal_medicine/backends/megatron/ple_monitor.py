@@ -93,22 +93,12 @@ class PLEHealthMonitor(TorchProbe):
                 result.append((global_idx, layer.ple))
         return result
 
-    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
-        for attr in ("layer_idx", "layer_index", "idx"):
-            value = getattr(layer, attr, None)
-            if isinstance(value, int):
-                return value
-        layer_number = getattr(layer, "layer_number", None)
-        if isinstance(layer_number, int):
-            return layer_number - 1 if layer_number > 0 else layer_number
-        return self.pp_rank * num_local_layers + local_idx
-
     def _make_token_ple_hook(self):
         num_layers = self._num_layers
         H_ple = self._hidden_size_ple
 
         def hook_fn(module, inputs, output):
-            if not self._should_monitor():
+            if not self.log_global or not self._should_monitor():
                 return
             with torch.no_grad():
                 B, S, _ = output.shape
@@ -121,7 +111,7 @@ class PLEHealthMonitor(TorchProbe):
         H = self._hidden_size
 
         def hook_fn(module, inputs, output):
-            if not self._should_monitor():
+            if not self.log_global or not self._should_monitor():
                 return
             with torch.no_grad():
                 self._proj_ple_buf = output * (H**-0.5)
@@ -132,7 +122,7 @@ class PLEHealthMonitor(TorchProbe):
         per_layer_input_scale = 2.0**-0.5
 
         def hook_fn(module, inputs, output):
-            if not self._should_monitor():
+            if not self.log_global or not self._should_monitor():
                 return
             if self._token_ple_buf is None or self._proj_ple_buf is None:
                 return
@@ -144,8 +134,8 @@ class PLEHealthMonitor(TorchProbe):
                     cosine = compute_branch_cosine(token_ple, proj_ple)
                     log_dict = {}
                     for name, val in norms.items():
-                        log_dict[f"ple_health/global_{name}"] = val.item()
-                    log_dict["ple_health/global_token_proj_cosine"] = cosine.item()
+                        log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val.item()
+                    log_dict[f"{self.METRIC_PREFIX}/global_token_proj_cosine"] = cosine.item()
                     training_logs.update(**log_dict)
             except Exception as e:
                 if self.verbose:

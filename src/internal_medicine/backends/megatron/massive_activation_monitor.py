@@ -151,17 +151,6 @@ class MassiveActivationMonitor(TorchProbe):
 
         return list(enumerate(layers))
 
-    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int, layer_offset: int = 0) -> int:
-        """Resolve a stable global layer id when model layers expose one."""
-        for attr in ("layer_idx", "layer_index", "idx"):
-            value = getattr(layer, attr, None)
-            if isinstance(value, int):
-                return value
-        layer_number = getattr(layer, "layer_number", None)
-        if isinstance(layer_number, int):
-            return layer_number - 1 if layer_number > 0 else layer_number
-        return self.pp_rank * num_local_layers + layer_offset + local_idx
-
     def _make_residual_hook(self, layer_idx: int):
         """Create a forward pre-hook that captures the residual stream."""
 

@@ -96,16 +96,6 @@ class QKStatsMonitor(TorchProbe):
                 attention_layers.append((global_idx, attn))
         return attention_layers
 
-    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
-        for attr in ("layer_idx", "layer_index", "idx"):
-            value = getattr(layer, attr, None)
-            if isinstance(value, int):
-                return value
-        layer_number = getattr(layer, "layer_number", None)
-        if isinstance(layer_number, int):
-            return layer_number - 1 if layer_number > 0 else layer_number
-        return self.pp_rank * num_local_layers + local_idx
-
     def _aggregate_tp_stats(self, stats: dict) -> dict:
         data = torch.tensor(
             [stats["max_global"], stats["mean_global"], stats["entropy_global"], stats["sink_global"]],

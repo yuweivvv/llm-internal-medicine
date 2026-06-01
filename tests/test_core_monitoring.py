@@ -1,0 +1,91 @@
+import importlib
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+Probe = importlib.import_module("internal_medicine.core.base_monitor").Probe
+AVAILABLE_MONITORS = importlib.import_module("internal_medicine.core.registry").AVAILABLE_MONITORS
+training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
+
+
+class DummyProbe(Probe):
+    METRIC_PREFIX = "dummy"
+    MAX_AGGREGATED = {"peak"}
+    MIN_AGGREGATED = {"floor"}
+
+    def register_hooks(self, model) -> None:
+        return None
+
+
+class CoreMonitoringTest(unittest.TestCase):
+    def setUp(self):
+        training_logs.reset()
+
+    def tearDown(self):
+        training_logs.reset()
+
+    def test_record_metrics_logs_per_layer_and_global_once_per_observation(self):
+        probe = DummyProbe(log_per_layer=True, log_global=True)
+
+        probe._record_metrics(0, {"mean": 2.0, "peak": 5.0, "floor": 3.0})
+        probe._record_metrics(1, {"mean": 4.0, "peak": 2.0, "floor": 1.0})
+
+        self.assertEqual(probe._global_count, 2)
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertEqual(latest["dummy/layer_0/mean"], 2.0)
+        self.assertEqual(latest["dummy/layer_1/mean"], 4.0)
+        self.assertEqual(latest["dummy/global_mean"], 3.0)
+        self.assertEqual(latest["dummy/global_peak"], 5.0)
+        self.assertEqual(latest["dummy/global_floor"], 1.0)
+        self.assertEqual(probe._global_count, 0)
+        self.assertEqual(probe._global_accum, {})
+
+    def test_log_flags_are_respected(self):
+        probe = DummyProbe(log_per_layer=False, log_global=True)
+        probe._record_metrics(0, {"mean": 2.0})
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertNotIn("dummy/layer_0/mean", latest)
+        self.assertEqual(latest["dummy/global_mean"], 2.0)
+
+        training_logs.reset()
+        probe = DummyProbe(log_per_layer=True, log_global=False)
+        probe._record_metrics(0, {"mean": 7.0})
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertEqual(latest["dummy/layer_0/mean"], 7.0)
+        self.assertNotIn("dummy/global_mean", latest)
+        self.assertEqual(probe._global_count, 0)
+
+    def test_empty_metrics_do_not_count_or_log(self):
+        probe = DummyProbe(log_per_layer=True, log_global=True)
+        probe._record_metrics(0, {})
+        probe.step()
+
+        self.assertEqual(probe._global_count, 0)
+        self.assertEqual(training_logs.get_latest(prefix="dummy"), {})
+
+    def test_resolve_layer_idx_prefers_explicit_attrs_then_layer_number_then_offset(self):
+        probe = DummyProbe()
+
+        self.assertEqual(probe._resolve_layer_idx(SimpleNamespace(layer_idx=9), 0, 4), 9)
+        self.assertEqual(probe._resolve_layer_idx(SimpleNamespace(layer_number=3), 0, 4), 2)
+        self.assertEqual(probe._resolve_layer_idx(SimpleNamespace(), 2, 4), 2)
+
+        probe.pp_rank = 1
+        self.assertEqual(probe._resolve_layer_idx(SimpleNamespace(), 2, 4), 6)
+        self.assertEqual(probe._resolve_layer_idx(SimpleNamespace(), 2, 4, layer_offset=8), 14)
+
+    def test_paddlefleet_registry_lists_massive_activation_monitor(self):
+        self.assertIn("massive_act", AVAILABLE_MONITORS["paddlefleet"])
+
+
+if __name__ == "__main__":
+    unittest.main()

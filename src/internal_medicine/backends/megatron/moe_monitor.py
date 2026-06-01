@@ -131,16 +131,6 @@ class MoESpecialistMonitor(TorchProbe):
                 moe_layers.append((global_idx, moe_module))
         return moe_layers
 
-    def _resolve_layer_idx(self, layer: nn.Module, local_idx: int, num_local_layers: int) -> int:
-        for attr in ("layer_idx", "layer_index", "idx"):
-            value = getattr(layer, attr, None)
-            if isinstance(value, int):
-                return value
-        layer_number = getattr(layer, "layer_number", None)
-        if isinstance(layer_number, int):
-            return layer_number - 1 if layer_number > 0 else layer_number
-        return self.pp_rank * num_local_layers + local_idx
-
     def _make_router_hook(self, layer_idx: int, moe_layer: nn.Module):
         def hook_fn(module, _inputs, outputs):
             if not self._should_monitor():
@@ -169,6 +159,7 @@ class MoESpecialistMonitor(TorchProbe):
                 with torch.no_grad():
                     self._compute_expert_metrics(layer_idx, module)
             except Exception as e:
+                self._finalize_layer_observation(layer_idx)
                 if self.verbose:
                     logger.error(f"[MoEMonitor] MoE layer hook error layer {layer_idx}: {e}")
 
@@ -198,11 +189,17 @@ class MoESpecialistMonitor(TorchProbe):
             metrics["bias_affinity_jaccard"] = jaccard.item()
 
         # Per-layer log + global accumulate (no count increment — expert hook does that)
-        if self.log_per_layer and metrics:
-            training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
+        self._log_per_layer_metrics(layer_idx, metrics)
         if self.log_global and metrics:
             self._accumulate_global(metrics)
             self._pending_router_global_layers.add(layer_idx)
+
+    def _finalize_layer_observation(self, layer_idx: int, *, has_expert_metrics: bool = False):
+        """Finish one MoE layer observation and count global aggregation once."""
+        has_pending_router = layer_idx in self._pending_router_global_layers
+        if has_expert_metrics or has_pending_router:
+            self._count_global_observation()
+        self._pending_router_global_layers.discard(layer_idx)
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         metrics = {}
@@ -250,14 +247,11 @@ class MoESpecialistMonitor(TorchProbe):
                     ratio = compute_shared_routed_ratio(shared_norm, routed_norm_mean.clone().detach())
                     metrics["shared_routed_ratio"] = ratio.item()
 
-        has_pending_router = layer_idx in self._pending_router_global_layers
-
-        # _record_metrics handles per-layer log + global accumulate + count++
         if metrics:
-            self._record_metrics(layer_idx, metrics)
-        elif self.log_global and has_pending_router:
-            self._global_count += 1
-        self._pending_router_global_layers.discard(layer_idx)
+            self._log_per_layer_metrics(layer_idx, metrics)
+            if self.log_global:
+                self._accumulate_global(metrics)
+        self._finalize_layer_observation(layer_idx, has_expert_metrics=bool(metrics))
 
     def remove_hooks(self):
         super().remove_hooks()
@@ -281,6 +275,8 @@ class MoESpecialistMonitor(TorchProbe):
         self._pending_router_global_layers.clear()
 
     def step(self):
+        for layer_idx in list(self._pending_router_global_layers):
+            self._finalize_layer_observation(layer_idx)
         super().step()
         self._pending_router_global_layers.clear()
 

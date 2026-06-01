@@ -52,18 +52,22 @@ class Probe(ABC):
         """
         if not metrics:
             return
-        if self.log_per_layer:
-            training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
+        self._log_per_layer_metrics(layer_idx, metrics)
         if self.log_global:
             self._accumulate_global(metrics)
-            self._global_count += 1
+            self._count_global_observation()
+
+    def _log_per_layer_metrics(self, layer_idx: int, metrics: dict[str, float]):
+        """Write per-layer metric keys without touching global aggregation."""
+        if self.log_per_layer and metrics:
+            training_logs.update(**{f"{self.METRIC_PREFIX}/layer_{layer_idx}/{k}": v for k, v in metrics.items()})
 
     def _accumulate_global(self, metrics: dict[str, float]):
         """Accumulate into global buffer WITHOUT incrementing count.
 
         Use when a layer emits metrics from multiple hooks (e.g., MoE
-        router + expert). Pair with a single _record_metrics call on
-        the final hook to get the count increment.
+        router + expert). Pair with a single _count_global_observation()
+        call when the complete layer observation is finished.
         """
         for name, val in metrics.items():
             if name in self.MAX_AGGREGATED:
@@ -72,6 +76,11 @@ class Probe(ABC):
                 self._global_accum[name] = min(self._global_accum.get(name, float("inf")), val)
             else:
                 self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+
+    def _count_global_observation(self):
+        """Count one complete layer observation for global averages."""
+        if self.log_global:
+            self._global_count += 1
 
     def _flush_global_metrics(self):
         """Aggregate accumulated metrics into global keys and write to training_logs."""
@@ -87,6 +96,17 @@ class Probe(ABC):
         training_logs.update(**log_dict)
         self._global_accum = {}
         self._global_count = 0
+
+    def _resolve_layer_idx(self, layer, local_idx: int, num_local_layers: int, layer_offset: int = 0) -> int:
+        """Resolve a stable global layer id when model layers expose one."""
+        for attr in ("layer_idx", "layer_index", "idx"):
+            value = getattr(layer, attr, None)
+            if isinstance(value, int):
+                return value
+        layer_number = getattr(layer, "layer_number", None)
+        if isinstance(layer_number, int):
+            return layer_number - 1 if layer_number > 0 else layer_number
+        return self.pp_rank * num_local_layers + layer_offset + local_idx
 
 
 BaseMonitor = Probe

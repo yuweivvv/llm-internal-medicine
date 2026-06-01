@@ -182,16 +182,6 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 attention_layers.append((global_idx, attn))
         return attention_layers
 
-    def _resolve_layer_idx(self, layer: nn.Layer, local_idx: int, num_local_layers: int) -> int:
-        for attr in ("layer_idx", "layer_index", "idx"):
-            value = getattr(layer, attr, None)
-            if isinstance(value, int):
-                return value
-        layer_number = getattr(layer, "layer_number", None)
-        if isinstance(layer_number, int):
-            return layer_number - 1 if layer_number > 0 else layer_number
-        return self.pp_rank * num_local_layers + local_idx
-
     def _get_decoder_layers(self, model):
         if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
             model = model._layers
