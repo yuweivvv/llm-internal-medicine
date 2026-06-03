@@ -6,14 +6,24 @@ as characterized by Sun et al. (2026) arXiv:2603.05498.
 
 Core metrics:
 1. Channel Max — absolute maximum activation across all channels
-2. Channel Max Ratio — ratio of max channel to median channel (outlier severity)
-3. Massive Activation Channel Count — channels exceeding a magnitude threshold
-4. Top-K Channel Norm — L2 norm of the top-K largest channels
-5. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm
-6. Post-Norm Cosine Stability — cosine similarity of normalized representations
+2. Channel Median/P95/P99 — distribution of per-channel peak magnitudes
+3. Channel Max Ratio — ratio of max channel to median channel (outlier severity)
+4. Channel Counts over absolute thresholds — broad residual-scale growth
+5. Massive Activation Channel Count — channels over median-relative threshold
+6. Top-K Channel Norm — L2 norm of the top-K largest channels
+7. Activation RMS — residual-stream scale
+8. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm
+9. Post-Norm Cosine Stability — cosine similarity of normalized representations
 """
 
 import paddle
+
+DEFAULT_ABSOLUTE_THRESHOLDS = (10.0, 20.0, 30.0)
+
+
+def _threshold_key(threshold: float) -> str:
+    text = f"{threshold:g}"
+    return text.replace("-", "neg").replace(".", "p")
 
 
 def compute_per_channel_max(hidden_states: paddle.Tensor) -> paddle.Tensor:
@@ -22,10 +32,24 @@ def compute_per_channel_max(hidden_states: paddle.Tensor) -> paddle.Tensor:
     return h.abs().max(axis=0)
 
 
+def compute_activation_scale_stats(hidden_states: paddle.Tensor) -> dict[str, float]:
+    """Absolute scale statistics over the full residual stream."""
+    h = hidden_states.reshape([-1, hidden_states.shape[-1]]).astype("float32")
+    return {
+        "activation_rms": float(paddle.sqrt(paddle.square(h).mean())),
+    }
+
+
+def _nearest_quantile_from_sorted(sorted_values: paddle.Tensor, q: float) -> float:
+    idx = min(max(round((sorted_values.shape[0] - 1) * q), 0), sorted_values.shape[0] - 1)
+    return float(sorted_values[idx])
+
+
 def summarize_per_channel_max(
     per_channel_max: paddle.Tensor,
     threshold_multiplier: float = 100.0,
     k: int = 3,
+    absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
 ) -> dict[str, float]:
     """Derive scalar massive-activation metrics from per-channel maxima."""
     channel_max = float(per_channel_max.max())
@@ -37,12 +61,22 @@ def summarize_per_channel_max(
 
     topk_vals, _ = paddle.topk(per_channel_max, min(k, per_channel_max.shape[0]))
     topk_channel_norm = float(topk_vals.norm())
+    sorted_channel_max = paddle.sort(per_channel_max)
 
     return {
         "channel_max": channel_max,
+        "channel_median": channel_median,
+        "channel_p95": _nearest_quantile_from_sorted(sorted_channel_max, 0.95),
+        "channel_p99": _nearest_quantile_from_sorted(sorted_channel_max, 0.99),
         "channel_max_ratio": channel_max_ratio,
         "massive_act_channel_count": massive_act_channel_count,
         "topk_channel_norm": topk_channel_norm,
+        **{
+            f"channel_count_gt_{_threshold_key(absolute_threshold)}": float(
+                (per_channel_max > absolute_threshold).astype("float32").sum()
+            )
+            for absolute_threshold in absolute_thresholds
+        },
     }
 
 
@@ -50,6 +84,7 @@ def compute_pre_norm_metrics(
     hidden_states: paddle.Tensor,
     threshold_multiplier: float = 100.0,
     k: int = 3,
+    absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
 ) -> dict[str, float]:
     """All pre-norm massive activation metrics in one pass.
 
@@ -61,12 +96,13 @@ def compute_pre_norm_metrics(
         k: number of top channels for top-K norm.
 
     Returns:
-        Dict with channel_max, channel_max_ratio, massive_act_channel_count, topk_channel_norm.
+        Dict with per-channel peak, outlier, absolute-threshold, and top-K metrics.
     """
     return summarize_per_channel_max(
         compute_per_channel_max(hidden_states),
         threshold_multiplier=threshold_multiplier,
         k=k,
+        absolute_thresholds=absolute_thresholds,
     )
 
 

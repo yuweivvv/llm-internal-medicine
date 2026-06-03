@@ -7,11 +7,14 @@ Anatomy of Massive Activations and Attention Sinks" (arXiv:2603.05498).
 
 Core metrics:
 1. Channel Max — absolute maximum activation across all channels
-2. Channel Max Ratio — ratio of max channel to median channel (outlier severity)
-3. Massive Activation Channel Count — number of channels exceeding a magnitude threshold
-4. Top-K Channel Norm — L2 norm of the top-K largest channels
-5. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm (sparsification)
-6. Post-Norm Cosine Stability — cosine similarity of normalized representations
+2. Channel Median/P95/P99 — distribution of per-channel peak magnitudes
+3. Channel Max Ratio — ratio of max channel to median channel (outlier severity)
+4. Channel Counts over absolute thresholds — broad residual-scale growth
+5. Massive Activation Channel Count — channels over median-relative threshold
+6. Top-K Channel Norm — L2 norm of the top-K largest channels
+7. Activation RMS — residual-stream scale
+8. Post-Norm Sparsity — fraction of near-zero entries after RMSNorm (sparsification)
+9. Post-Norm Cosine Stability — cosine similarity of normalized representations
    across tokens (near-constant vector detection)
 
 All metrics compute local values only; cross-rank aggregation is handled
@@ -25,6 +28,13 @@ Reference:
 
 import torch
 
+DEFAULT_ABSOLUTE_THRESHOLDS = (10.0, 20.0, 30.0)
+
+
+def _threshold_key(threshold: float) -> str:
+    text = f"{threshold:g}"
+    return text.replace("-", "neg").replace(".", "p")
+
 
 def compute_per_channel_max(hidden_states: torch.Tensor) -> torch.Tensor:
     """Per-channel maximum absolute activation for [..., H] hidden states."""
@@ -32,10 +42,25 @@ def compute_per_channel_max(hidden_states: torch.Tensor) -> torch.Tensor:
     return h.abs().max(dim=0).values
 
 
+def compute_activation_scale_stats(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Absolute scale statistics over the full residual stream."""
+    h = hidden_states.reshape(-1, hidden_states.shape[-1]).float()
+    return {
+        "activation_rms": h.square().mean().sqrt(),
+    }
+
+
+def _nearest_quantile_from_sorted(sorted_values: torch.Tensor, q: float) -> torch.Tensor:
+    idx = round((sorted_values.shape[0] - 1) * q)
+    idx = min(max(idx, 0), sorted_values.shape[0] - 1)
+    return sorted_values[idx]
+
+
 def summarize_per_channel_max(
     per_channel_max: torch.Tensor,
     threshold_multiplier: float = 100.0,
     k: int = 3,
+    absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
 ) -> dict[str, torch.Tensor]:
     """Derive scalar massive-activation metrics from per-channel maxima."""
     channel_max = per_channel_max.max()
@@ -43,14 +68,22 @@ def summarize_per_channel_max(
     channel_max_ratio = channel_max / channel_median.clamp(min=1e-8)
     threshold = channel_median * threshold_multiplier
     topk_vals = per_channel_max.topk(min(k, per_channel_max.shape[0])).values
+    sorted_channel_max = per_channel_max.sort().values
 
-    return {
+    metrics = {
         "channel_max": channel_max,
         "channel_median": channel_median,
+        "channel_p95": _nearest_quantile_from_sorted(sorted_channel_max, 0.95),
+        "channel_p99": _nearest_quantile_from_sorted(sorted_channel_max, 0.99),
         "channel_max_ratio": channel_max_ratio,
         "massive_act_channel_count": (per_channel_max > threshold).sum().float(),
         "topk_channel_norm": topk_vals.norm(),
     }
+    for absolute_threshold in absolute_thresholds:
+        metrics[f"channel_count_gt_{_threshold_key(absolute_threshold)}"] = (
+            per_channel_max > absolute_threshold
+        ).sum().float()
+    return metrics
 
 
 def compute_channel_max(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -67,6 +100,7 @@ def compute_channel_max(hidden_states: torch.Tensor) -> dict[str, torch.Tensor]:
         Dict with:
             channel_max: max absolute value across all positions and channels (scalar)
             channel_median: median of per-channel max absolute values (scalar)
+            channel_p95/channel_p99: high quantiles of per-channel max absolute values
             channel_max_ratio: channel_max / channel_median (outlier severity)
     """
     return summarize_per_channel_max(compute_per_channel_max(hidden_states))

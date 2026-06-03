@@ -72,6 +72,36 @@ class CoreMonitoringTest(unittest.TestCase):
         self.assertEqual(probe._global_count, 0)
         self.assertEqual(training_logs.get_latest(prefix="dummy"), {})
 
+    def test_massive_activation_scale_keys_are_max_aggregated(self):
+        for key in (
+            "massive_act/layer_0/channel_max_ratio",
+            "massive_act/layer_0/channel_median",
+            "massive_act/layer_0/channel_p95",
+            "massive_act/layer_0/channel_p99",
+            "massive_act/layer_0/massive_act_channel_count",
+            "massive_act/layer_0/channel_count_gt_100",
+            "massive_act/layer_0/activation_rms",
+        ):
+            self.assertTrue(training_logs._is_max_metric(key), key)
+
+    def test_channel_count_gt_is_max_aggregated_across_layers(self):
+        probe = DummyProbe(log_per_layer=False, log_global=True)
+        probe._record_metrics(0, {"channel_count_gt_100": 0.0})
+        probe._record_metrics(1, {"channel_count_gt_100": 3.0})
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertEqual(latest["dummy/global_channel_count_gt_100"], 3.0)
+
+    def test_massive_act_channel_count_is_max_aggregated_across_layers(self):
+        probe = DummyProbe(log_per_layer=False, log_global=True)
+        probe._record_metrics(0, {"massive_act_channel_count": 0.0})
+        probe._record_metrics(1, {"massive_act_channel_count": 2.0})
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertEqual(latest["dummy/global_massive_act_channel_count"], 2.0)
+
     def test_resolve_layer_idx_prefers_explicit_attrs_then_layer_number_then_offset(self):
         probe = DummyProbe()
 

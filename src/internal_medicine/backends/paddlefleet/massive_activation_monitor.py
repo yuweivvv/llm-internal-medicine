@@ -16,9 +16,14 @@ sparsification that enables attention sinks.
 
 Metrics produced:
     massive_act/layer_{i}/channel_max
+    massive_act/layer_{i}/channel_median
+    massive_act/layer_{i}/channel_p95
+    massive_act/layer_{i}/channel_p99
     massive_act/layer_{i}/channel_max_ratio
     massive_act/layer_{i}/massive_act_channel_count
+    massive_act/layer_{i}/channel_count_gt_{x}
     massive_act/layer_{i}/topk_channel_norm
+    massive_act/layer_{i}/activation_rms
     massive_act/layer_{i}/post_norm_sparsity
     massive_act/layer_{i}/post_norm_cosine
     massive_act/global_*
@@ -31,6 +36,8 @@ import paddle.nn as nn
 
 from .base import PaddleProbe
 from .massive_activation_metrics import (
+    DEFAULT_ABSOLUTE_THRESHOLDS,
+    compute_activation_scale_stats,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
     compute_post_norm_sparsity,
@@ -48,7 +55,15 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
     """
 
     METRIC_PREFIX = "massive_act"
-    MAX_AGGREGATED = {"channel_max", "channel_max_ratio", "topk_channel_norm"}
+    MAX_AGGREGATED = {
+        "channel_max",
+        "channel_median",
+        "channel_p95",
+        "channel_p99",
+        "channel_max_ratio",
+        "topk_channel_norm",
+        "activation_rms",
+    }
 
     def __init__(
         self,
@@ -61,6 +76,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         sparsity_epsilon: float = 0.01,
         cosine_sample_pairs: int = 256,
         sample_layers: list[int] | None = None,
+        absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
     ):
         super().__init__(
             log_per_layer=log_per_layer,
@@ -73,6 +89,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         self.sparsity_epsilon = sparsity_epsilon
         self.cosine_sample_pairs = cosine_sample_pairs
         self.sample_layers = set(sample_layers) if sample_layers else None
+        self.absolute_thresholds = tuple(absolute_thresholds)
         self.tp_size = 1
         self.tp_group = None
         self._warned_per_channel_aggregate = False
@@ -181,7 +198,9 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             per_channel_max,
             threshold_multiplier=self.spike_threshold_multiplier,
             k=self.topk_channels,
+            absolute_thresholds=self.absolute_thresholds,
         )
+        metrics.update(compute_activation_scale_stats(hidden_states))
 
         norm_layer = getattr(module, "input_layernorm", None)
         if norm_layer is not None:
@@ -224,6 +243,7 @@ def setup_massive_activation_monitor(
     sparsity_epsilon: float = 0.01,
     cosine_sample_pairs: int = 256,
     sample_layers: list[int] | None = None,
+    absolute_thresholds: tuple[float, ...] = DEFAULT_ABSOLUTE_THRESHOLDS,
     monitor_dict: dict | None = None,
 ):
     monitor = PaddleMassiveActivationMonitor(
@@ -236,6 +256,7 @@ def setup_massive_activation_monitor(
         sparsity_epsilon=sparsity_epsilon,
         cosine_sample_pairs=cosine_sample_pairs,
         sample_layers=sample_layers,
+        absolute_thresholds=absolute_thresholds,
     )
     monitor.register_hooks(model)
     logger.info(f"[MassiveActMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")

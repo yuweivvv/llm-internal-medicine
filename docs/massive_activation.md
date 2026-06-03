@@ -1,6 +1,6 @@
 # Massive Activation Monitor
 
-**Residual Stream Massive Activation 健康监控模块**，监控 6 个核心指标。
+**Residual Stream Massive Activation 健康监控模块**，监控 13 个核心指标。
 
 基于论文发现实现：
 
@@ -51,7 +51,25 @@ channel_max = max(|H_i|)
 
 ---
 
-### 2. Channel Max Ratio (通道异常比)
+### 2. Channel Median / P95 / P99 (通道峰值分布)
+
+**数学公式：**
+```
+channel_median = median(per_channel_max)
+channel_p95 = p95(per_channel_max)
+channel_p99 = p99(per_channel_max)
+```
+
+对每个 hidden channel 的最大绝对值做分布统计。
+
+**诊断意义：**
+- `channel_median` 是 residual stream 的基准通道量级
+- `channel_p95/p99` 用于判断是否是大范围 scale growth，而不是少数 outlier channel
+- 如果 `channel_max` 上升但 `p95/p99` 基本不动，更像少数通道 spike；如果三者一起上升，更像整体激活量级膨胀
+
+---
+
+### 3. Channel Max Ratio (通道异常比)
 
 **数学公式：**
 ```
@@ -67,7 +85,7 @@ channel_max_ratio = max(per_channel_max) / median(per_channel_max)
 
 ---
 
-### 3. Massive Activation Channel Count (异常通道数)
+### 4. Massive Activation Channel Count (异常通道数)
 
 **数学公式：**
 ```
@@ -83,7 +101,26 @@ massive_act_channel_count = |{c : max_pos(|H_i[:, c]|) > median × threshold_mul
 
 ---
 
-### 4. Top-3 Channel Norm (Top-K 通道范数)
+### 5. Absolute Channel Counts (绝对阈值通道数)
+
+**数学公式：**
+```
+channel_count_gt_10 = |{c : per_channel_max[c] > 10}|
+channel_count_gt_20 = |{c : per_channel_max[c] > 20}|
+channel_count_gt_30 = |{c : per_channel_max[c] > 30}|
+```
+
+按绝对激活幅度统计超过 10、20、30 的 channel 数量。
+
+**诊断意义：**
+- `massive_act_channel_count` 是 median-relative outlier 数量
+- `channel_count_gt_10/20/30` 是 absolute scale growth 数量
+- 默认 `10/20/30` 更适合当前 1.5B 训练的激活量级；如果观察大幅度 BF16 runaway，可以通过 `absolute_thresholds` 显式切到更高阈值，例如 `(50.0, 100.0, 200.0)`
+- 这组指标适合对比不同训练设置下 residual stream 是否整体变大，例如 BF16 vs FP4
+
+---
+
+### 6. Top-3 Channel Norm (Top-K 通道范数)
 
 **数学公式：**
 ```
@@ -99,7 +136,23 @@ topk_channel_norm = ||topk(per_channel_max, k=3)||₂
 
 ---
 
-### 5. Post-Norm Sparsity (归一化后稀疏度)
+### 7. Activation RMS (整体激活 RMS)
+
+**数学公式：**
+```
+activation_rms = sqrt(mean(H_i^2))
+```
+
+对 residual stream 的全部 token 和 channel 计算 RMS。
+
+**诊断意义：**
+- 用于观察整体激活量级，而不是只看最大 channel
+- 与 `channel_p95/p99`、`channel_count_gt_*` 配合判断 broad scale growth
+- 对量化训练很有参考价值：RMS 上升意味着更多通道进入较高动态范围
+
+---
+
+### 8. Post-Norm Sparsity (归一化后稀疏度)
 
 **数学公式：**
 ```
@@ -121,7 +174,7 @@ RMSNorm(h^(s)) ≈ Σ_{i∈C} h̃_i^(s) e_i
 
 ---
 
-### 6. Post-Norm Cosine Stability (归一化后余弦稳定性)
+### 9. Post-Norm Cosine Stability (归一化后余弦稳定性)
 
 **数学公式：**
 ```
@@ -151,11 +204,17 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 | `channel_max` | < 100 | NORMAL | 非 spike 层 |
 | | 100 ~ 5000 | SPIKE | 典型 massive activation |
 | | > 10000 | SEVERE | 极端放大，检查 weight decay |
+| `channel_p95/p99` | 趋势平稳 | NORMAL | 多数通道量级稳定 |
+| | 持续上升 | WARNING | residual stream 整体 scale growth |
 | `channel_max_ratio` | < 10 | NORMAL | 各 channel 量级接近 |
 | | 10 ~ 1000 | SPIKE | 存在少数异常 channel |
 | | > 1000 | SEVERE | 极端通道不平衡 |
 | `massive_act_channel_count` | 0 ~ 5 | NORMAL | 典型 spike pattern |
 | | > 10 | WARNING | 异常 channel 过多 |
+| `channel_count_gt_10/20/30` | 趋势平稳 | NORMAL | 高幅度通道数量稳定 |
+| | 持续上升 | WARNING | 大范围激活膨胀 |
+| `activation_rms` | 趋势平稳 | NORMAL | 整体残差流量级稳定 |
+| | 持续上升 | WARNING | 需要关注训练或量化动态范围 |
 | `post_norm_sparsity` | < 0.5 | NORMAL | 归一化后信息丰富 |
 | | > 0.8 | HIGH | 高度稀疏，implicit parameter 效应 |
 | `post_norm_cosine` | < 0.5 | DIVERSE | token 表示多样 |
@@ -258,6 +317,7 @@ for key, val in sorted(spike_metrics.items()):
 | `verbose` | `False` | 打印调试信息 |
 | `spike_threshold_multiplier` | `100.0` | spike channel 判定阈值 = median × 此值 |
 | `topk_channels` | `3` | Top-K 通道数（对应论文 Figure 1） |
+| `absolute_thresholds` | `(10.0, 20.0, 30.0)` | 绝对幅度通道计数阈值 |
 | `sparsity_epsilon` | `0.01` | post-norm sparsity 判定阈值 |
 | `cosine_sample_pairs` | `256` | cosine stability 的采样对数 |
 | `sample_layers` | `None` | 要监控的层索引列表，None=全部 |

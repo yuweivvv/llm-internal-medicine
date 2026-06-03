@@ -13,7 +13,14 @@ logger = logging.getLogger(__name__)
 
 __all__ = ("SmoothedValue", "TrainingLogs", "training_logs")
 
-MAX_AGGREGATED_SUFFIXES = ("topk_channel_norm",)
+MAX_AGGREGATED_SUFFIXES = (
+    "topk_channel_norm",
+    "channel_max_ratio",
+    "channel_median",
+    "channel_p95",
+    "channel_p99",
+    "activation_rms",
+)
 
 
 class SmoothedValue:
@@ -102,7 +109,14 @@ class TrainingLogs:
 
     @staticmethod
     def _is_max_metric(key: str) -> bool:
-        return "/max" in key or key.endswith("_max") or key.endswith(MAX_AGGREGATED_SUFFIXES)
+        metric_name = key.rsplit("/", 1)[-1]
+        return (
+            "/max" in key
+            or key.endswith("_max")
+            or key.endswith(MAX_AGGREGATED_SUFFIXES)
+            or metric_name == "massive_act_channel_count"
+            or metric_name.startswith("channel_count_gt_")
+        )
 
     @staticmethod
     def _is_min_metric(key: str) -> bool:

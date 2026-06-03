@@ -149,7 +149,12 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         training_logs.reset()
 
     def test_compute_and_log_records_pre_norm_metrics(self):
-        monitor = MassiveActivationMonitor(log_per_layer=True, log_global=True, cosine_sample_pairs=4)
+        monitor = MassiveActivationMonitor(
+            log_per_layer=True,
+            log_global=True,
+            cosine_sample_pairs=4,
+            absolute_thresholds=(2.0, 3.0),
+        )
         hidden_states = torch.tensor(
             [
                 [[1.0, -2.0, 0.5, 4.0]],
@@ -161,9 +166,22 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
         monitor.step()
 
         latest = training_logs.get_latest(prefix="massive_act")
-        for key in ("channel_max", "channel_max_ratio", "massive_act_channel_count", "topk_channel_norm"):
+        for key in (
+            "channel_max",
+            "channel_median",
+            "channel_p95",
+            "channel_p99",
+            "channel_max_ratio",
+            "massive_act_channel_count",
+            "channel_count_gt_2",
+            "channel_count_gt_3",
+            "topk_channel_norm",
+            "activation_rms",
+        ):
             self.assertIn(f"massive_act/layer_0/{key}", latest)
             self.assertIn(f"massive_act/global_{key}", latest)
+        self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 2.0)
+        self.assertEqual(latest["massive_act/layer_0/channel_count_gt_3"], 1.0)
 
 
 if __name__ == "__main__":

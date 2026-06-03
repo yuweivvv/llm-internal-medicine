@@ -70,12 +70,19 @@ class Probe(ABC):
         call when the complete layer observation is finished.
         """
         for name, val in metrics.items():
-            if name in self.MAX_AGGREGATED:
+            if self._is_max_aggregated(name):
                 self._global_accum[name] = max(self._global_accum.get(name, float("-inf")), val)
             elif name in self.MIN_AGGREGATED:
                 self._global_accum[name] = min(self._global_accum.get(name, float("inf")), val)
             else:
                 self._global_accum[name] = self._global_accum.get(name, 0.0) + val
+
+    def _is_max_aggregated(self, name: str) -> bool:
+        return (
+            name in self.MAX_AGGREGATED
+            or name == "massive_act_channel_count"
+            or name.startswith("channel_count_gt_")
+        )
 
     def _count_global_observation(self):
         """Count one complete layer observation for global averages."""
@@ -89,7 +96,7 @@ class Probe(ABC):
             return
         log_dict = {}
         for name, val in self._global_accum.items():
-            if name in self.MAX_AGGREGATED or name in self.MIN_AGGREGATED:
+            if self._is_max_aggregated(name) or name in self.MIN_AGGREGATED:
                 log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val
             else:
                 log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val / self._global_count
