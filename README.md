@@ -4,7 +4,7 @@
 
 包含四大监控模块：
 - **[MoE Health](./docs/moe_specialist.md)** — MoE 专家系统健康监控 (13 指标)
-- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (10 指标)
+- **[QK Stats](./docs/qk_logits.md)** — 注意力 QK 统计监控 (9 指标)
 - **[Massive Activation Health](./docs/massive_activation.md)** — Residual Stream Massive Activation 健康监控 (13 指标)
 - **[PLE Health](./docs/ple_health.md)** — Per-Layer Embedding 健康监控 (7 指标)
 
@@ -52,6 +52,23 @@ cfg.model.register_pre_wrap_hook(partial(
 ))
 ```
 
+NeMo YAML 中推荐使用 dict 形式，便于按 monitor 传独立参数：
+
+```yaml
+internal_medicine_monitor_interval: 50
+internal_medicine_hook_timing: false
+internal_medicine_monitors:
+    qk_stats: true
+    moe_health: true
+    massive_act:
+        log_activation_rms: false
+        log_post_norm_metrics: false
+```
+
+`true` 表示启用该 monitor 并使用默认参数；嵌套 dict 会作为该 monitor 的 kwargs 透传，例如上面的 `massive_act` 等价于
+`setup_internal_medicine(..., massive_act={"log_activation_rms": False, "log_post_norm_metrics": False})`。
+list 形式仍兼容，但需要按 monitor 传参时不要再额外加 `internal_medicine_monitor_kwargs` 字段。
+
 ### 读取指标
 
 ```python
@@ -86,6 +103,9 @@ setup_internal_medicine()
     ├── setup_qk_monitor()    → QKStatsMonitor     → forward pre-hooks on core_attention
     ├── setup_massive_activation_monitor() → MassiveActivationMonitor → forward pre-hooks on transformer layers
     └── setup_ple_monitor()   → PLEHealthMonitor   → forward hooks on PLE modules
+                                        │
+                                        ▼
+                              GPU 0-dim accumulators
                                         │
                                         ▼
                               training_logs (singleton)
@@ -157,10 +177,9 @@ setup_internal_medicine()
 | 4 | `sink` | `qk_stats/.../sink` | `mean(softmax[..., 0])` | 每层+全局 | Token-0 注意力权重 |
 | 5 | `entropy_min` | `qk_stats/.../entropy_min` | `min(per_head_entropy)` | 每层+全局 | 最尖锐 head 的熵 |
 | 6 | `entropy_max` | `qk_stats/.../entropy_max` | `max(per_head_entropy)` | 每层+全局 | 最分散 head 的熵 |
-| 7 | `entropy_std` | `qk_stats/.../entropy_std` | `std(per_head_entropy)` | 每层+全局 | Head 行为分化度 |
-| 8 | `sink_head_ratio` | `qk_stats/.../sink_head_ratio` | `count(sink>θ)/N_heads` | 每层+全局 | Sink head 占比 |
-| 9 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
-| 10 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
+| 7 | `sink_head_ratio` | `qk_stats/.../sink_head_ratio` | `count(sink>θ)/N_heads` | 每层+全局 | Sink head 占比 |
+| 8 | `sink_head_max` | `qk_stats/.../sink_head_max` | `max(sink_per_head)` | 每层+全局 | 最强 sink head 权重 |
+| 9 | `sink_nonsink_gap` | `qk_stats/.../sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | 每层+全局 | Sink/非Sink 分化度 |
 
 ---
 
@@ -247,7 +266,7 @@ from internal_medicine import training_logs
 | 包含 `_min` 或以 `/min` 结尾 | `np.min(all_ranks)` |
 | 其他 | `np.mean(all_ranks)` |
 
-注意: QK Stats Monitor 额外在 hook 内部实现了 TP 级别的 `all_reduce`/`all_gather` 聚合（因为需要跨 TP ranks 的 per-head 信息）。MassiveAct 会先对 TP 内 per-channel maxima 做 `MAX all_reduce`，再依赖 `gather_and_aggregate` 做跨 rank 聚合；MoE/PLE 依赖 `gather_and_aggregate` 统一处理。
+注意: QK Stats Monitor 不在 hook 内做 TP `all_reduce`/`all_gather`，避免在 attention 热路径插入通信；跨 rank 聚合统一交给 `gather_and_aggregate()`。MassiveAct 会先对 TP 内 per-channel maxima 做 `MAX all_reduce`（通道维被 TP 切分时这是正确性所需），再依赖 `gather_and_aggregate()` 做跨 rank 聚合；MoE/PLE 同样依赖 `gather_and_aggregate()` 统一处理。
 
 ### 通用配置参数
 
@@ -259,12 +278,15 @@ from internal_medicine import training_logs
 | `log_global` | `True` | 记录全局聚合指标 |
 | `monitor_interval` | `1` | 监控间隔 (每 N 步采集一次) |
 | `verbose` | `False` | 打印调试信息 |
+| `hook_timing_enabled` | `False` | 记录每个 monitor hook 的 CPU wall time；用于定位监控开销，默认关闭 |
+
+NeMo Trainer 对应字段为 `internal_medicine_hook_timing`。开启后 trainer 会按日志间隔输出各 hook 的累计耗时和平均耗时；该开关只做 Python 侧计时，不会额外插入 CUDA 同步。
 
 ---
 
 ## 附录: 完整指标速查表
 
-共 43 个指标键 (13 MoE + 10 QK + 13 MassiveAct + 7 PLE)。
+共 42 个指标键 (13 MoE + 9 QK + 13 MassiveAct + 7 PLE)。
 
 | Monitor | 指标 | 公式 | SmoothedValue 模式 | 健康信号 |
 |---------|------|------|--------------------|----------|
@@ -287,7 +309,6 @@ from internal_medicine import training_logs
 | **QK** | `sink` | `p(token_0)` avg | mean | 不应过高 |
 | **QK** | `entropy_min` | `min(head_H)` | min | 不应过低 |
 | **QK** | `entropy_max` | `max(head_H)` | max | 合理范围 |
-| **QK** | `entropy_std` | `std(head_H)` | mean | 适度分化 |
 | **QK** | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | Sink head 占比 |
 | **QK** | `sink_head_max` | `max(sink_per_head)` | max | 最强 sink head |
 | **QK** | `sink_nonsink_gap` | `mean(sink) - mean(nonsink)` | mean | Sink vs 非Sink gap |

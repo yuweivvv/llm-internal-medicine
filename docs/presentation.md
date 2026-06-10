@@ -45,14 +45,14 @@ Internal Medicine  ≈  血液检查 + 影像学  → 知道"哪里在恶化"（
 │  ┌───────────────┐  ┌───────────────┐  ┌──────────────┐ │
 │  │  注意力健康     │  │  专家系统健康   │  │  PLE 结构健康  │ │
 │  │  QK Stats      │  │  MoE Health    │  │  PLE Health   │ │
-│  │  (7 指标)      │  │  (13 指标)     │  │  (7 指标)     │ │
+│  │  (9 指标)      │  │  (13 指标)     │  │  (7 指标)     │ │
 │  │               │  │               │  │              │ │
 │  │ 数值稳定性     │  │ 路由均衡性     │  │ 分支冗余度    │ │
 │  │ 注意力集中度   │  │ 专家发展均衡   │  │ 残差贡献比    │ │
 │  │ Sink 现象     │  │ 共享/路由平衡  │  │ 门控活跃度    │ │
 │  └───────────────┘  └───────────────┘  └──────────────┘ │
 │                                                          │
-│                   共 27 项诊断指标                         │
+│                   共 29 项诊断指标                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -171,15 +171,23 @@ sink = mean(softmax(logits)[..., position_0])
 - **高 sink**: 大量注意力被"倾倒"到第一个 token → Attention Sink 现象
 - 是 LLM 训练的已知现象，但过度 sink 影响模型质量
 
-**5-7) Entropy Min / Max / Std — Head 行为分化**
+**5-6) Entropy Min / Max — Head 行为极值**
 ```
 entropy_min = min(H_per_head)    — 最"尖锐"的 head
 entropy_max = max(H_per_head)    — 最"分散"的 head
-entropy_std = std(H_per_head)    — head 之间的差异度
 ```
 - 不需要记录每个 head，用分布统计量即可捕捉异常
 - **entropy_min 极低**: 某个 head 注意力坍缩，只盯着极少 token
-- **entropy_std 极高**: 不同 head 行为严重分化
+
+**7-9) Sink Head 分类 — Head 级 sink 行为**
+```
+sink_head_ratio = count(sink_per_head > threshold) / num_heads
+sink_head_max = max(sink_per_head)
+sink_nonsink_gap = mean(sink_heads) - mean(nonsink_heads)
+```
+- 识别哪些 head 把大量 attention mass 分配给 token-0
+- **sink_head_ratio 高**: 多数 head 进入 sink/gating 行为
+- **sink_nonsink_gap 高**: sink/non-sink head 分化明显
 
 #### Triton Online Softmax — 性能优化
 
@@ -441,13 +449,10 @@ global_idx = pp_rank * len(local_layers) + local_idx
 ### 5.1 两层通信模型
 
 ```
-Layer 1: Hook 内部通信 (仅 QK Stats)
-  ├── TP group 内 all_reduce (MAX)  — 1 scalar × 4 bytes
-  ├── TP group 内 all_reduce (SUM)  — 3 scalars × 4 bytes
-  └── TP group 内 all_gather        — [local_heads] × 4 bytes
-  范围: TP group（通常同一节点内，NVLink）
-  频率: 每层每步 (monitor_interval=1 时)
-  数据量: ~100 bytes/层/步
+Layer 1: Hook 内部通信
+  ├── QK / MoE / PLE: 无 hook-time collective
+  └── MassiveAct: TP 切通道维时，对 per-channel max 做一次 MAX all_reduce
+  原则: 除正确性必需外，hook hot path 避免 NCCL collective
 
 Layer 2: 全局聚合 (gather_and_aggregate)
   └── dist.all_gather_object(info_list, all_metrics)
@@ -460,7 +465,7 @@ Layer 2: 全局聚合 (gather_and_aggregate)
 
 | 通信 | 频率 | 单次数据量 | 每步总通信量 | 影响 |
 |------|------|-----------|-------------|------|
-| QK TP all_reduce/gather | 80 层 × 每步 | ~100 B/层 | 8 KB | **可忽略** (NVLink) |
+| QK hook 内通信 | — | 0 | 0 | 无；QK 主要成本是额外 QK stats 计算 |
 | PLE hook 内通信 | — | 0 | 0 | 无 |
 | MoE hook 内通信 | — | 0 | 0 | 无 |
 | `gather_and_aggregate` | 每 log_interval 步 | 90 KB × 512 rank | ~45 MB | **主要开销** |
@@ -492,17 +497,19 @@ dist.all_gather_object(info_list, all_metrics)  # Gloo backend, pickle
 
 ## 六、完整指标速查表
 
-### 6.1 QK Stats Monitor — 注意力健康 (7 指标)
+### 6.1 QK Stats Monitor — 注意力健康 (9 指标)
 
 | # | 指标 | 公式 | 聚合模式 | 异常信号 |
 |---|------|------|----------|----------|
-| 1 | `max` | `max(Q·K^T/√d)` | mean | 突然暴增 → 数值不稳定 |
+| 1 | `max` | `max(Q·K^T/√d)` | max | 突然暴增 → 数值不稳定 |
 | 2 | `mean` | `mean(valid_logits)` | mean | 持续偏移 → Q/K 权重漂移 |
 | 3 | `entropy_avg` | `-Σ(p·log(p))` head 均值 | mean | 过低 → 注意力坍缩 |
 | 4 | `sink` | `mean(p[..., 0])` | mean | 过高 → attention sink |
 | 5 | `entropy_min` | `min(H_per_head)` | min | 极低 → 某 head 坍缩 |
 | 6 | `entropy_max` | `max(H_per_head)` | max | 极高 → 某 head 无效 |
-| 7 | `entropy_std` | `std(H_per_head)` | mean | 极高 → head 行为严重分化 |
+| 7 | `sink_head_ratio` | `count(sink>threshold)/N_heads` | mean | 高 → 多数 head 进入 sink |
+| 8 | `sink_head_max` | `max(sink_per_head)` | max | 高 → 最强 sink head 极端 |
+| 9 | `sink_nonsink_gap` | `mean(sink)-mean(nonsink)` | mean | 高 → sink/non-sink 分化明显 |
 
 ### 6.2 MoE Specialist Monitor — 专家系统健康 (13 指标)
 

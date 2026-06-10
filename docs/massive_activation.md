@@ -237,13 +237,14 @@ RMSNorm(h^(a)) ≈ RMSNorm(h^(b))
 ## 性能说明
 
 ### 计算开销
-- **Pre-norm 指标**（channel_max 等）：一次 `abs().max(dim=0)`，O(S×H)，几乎零开销
+- **Pre-norm 指标**（channel_max 等）：一次 `abs().max(dim=0)` 加 per-channel 统计，复杂度约 O(S×H)
+- **TP per-channel 聚合**：Megatron/PaddleFleet TP 切通道维时会在 hook 内对 per-channel max 做一次 `MAX all_reduce`，这是正确性所需
 - **Post-norm 指标**：需要额外一次 RMSNorm forward（无梯度），开销约等于一个 norm 层
-- **Cosine stability**：采样 256 对，O(256×H)，可忽略
+- **Cosine stability**：采样 256 对，O(256×H)，通常较小
 
 ### 内存开销
-- 无额外 tensor 持久化（每层 hook 内计算后立即写入 training_logs）
 - 不保存激活值，不影响梯度计算
+- Megatron backend 会把 0-dim metric tensors 记录到 GPU accumulator，`monitor.step()` 再批量 flush 到 `training_logs`
 
 ### 推荐配置
 

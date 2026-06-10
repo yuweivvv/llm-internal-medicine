@@ -185,7 +185,7 @@
     {
       "id": "qk-estd-txt", "type": "text",
       "x": 475, "y": 350, "width": 380, "height": 62,
-      "text": "entropy_std — Head 间分化度\nstd(H_per_head)\n⚠ 过高 → 不同 head 行为严重分化",
+      "text": "sink_head_ratio / gap — Sink head 分化\ncount(sink>θ), mean(sink)-mean(non-sink)\n⚠ 过高 → 多数 head 进入 sink",
       "fontSize": 15, "fontFamily": 1, "textAlign": "left",
       "strokeColor": "#343a40", "backgroundColor": "transparent",
       "fillStyle": "solid", "strokeWidth": 1, "roughness": 0, "opacity": 100,

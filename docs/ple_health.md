@@ -171,20 +171,23 @@ gate_sparsity = (|act_fn(gate_out)| < threshold).float().mean()
 ### 基本用法
 
 ```python
-from internal_medicine.ple_health import setup_ple_monitor
+from internal_medicine import setup_internal_medicine
 
 # 设置监控
-model = setup_ple_monitor(
+monitor_dict = {}
+model = setup_internal_medicine(
     model,
-    log_per_layer=True,           # 记录每层指标
-    log_global=True,              # 记录全局聚合指标
-    monitor_interval=1,           # 每步监控
-    verbose=False,
-    gate_sparsity_threshold=0.01, # 门控稀疏度阈值
+    monitors=["ple_health"],
+    monitor_dict=monitor_dict,
+    monitor_interval=1,
+    ple_health={
+        "log_per_layer": True,
+        "log_global": True,
+        "gate_sparsity_threshold": 0.01,
+    },
 )
 
-# 获取 monitor 实例
-model, monitor = setup_ple_monitor(model, return_monitor=True)
+monitor = monitor_dict["ple_health"]
 
 # 训练循环中
 for step in range(num_steps):
