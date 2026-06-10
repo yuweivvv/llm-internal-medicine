@@ -132,6 +132,36 @@ class PaddleMassiveActivationMonitorTest(unittest.TestCase):
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 2.0)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_3"], 1.0)
 
+    def test_count_metrics_are_max_aggregated_across_layers(self):
+        monitor = PaddleMassiveActivationMonitor(
+            log_per_layer=False,
+            log_global=True,
+            absolute_thresholds=(2.0, 3.0),
+        )
+
+        monitor._record_metrics(
+            0,
+            {
+                "massive_act_channel_count": 0.0,
+                "channel_count_gt_2": 1.0,
+                "channel_count_gt_3": 0.0,
+            },
+        )
+        monitor._record_metrics(
+            1,
+            {
+                "massive_act_channel_count": 2.0,
+                "channel_count_gt_2": 3.0,
+                "channel_count_gt_3": 1.0,
+            },
+        )
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="massive_act")
+        self.assertEqual(latest["massive_act/global_massive_act_channel_count"], 2.0)
+        self.assertEqual(latest["massive_act/global_channel_count_gt_2"], 3.0)
+        self.assertEqual(latest["massive_act/global_channel_count_gt_3"], 1.0)
+
 
 class PaddleQKMonitorTest(unittest.TestCase):
     def test_resolve_layer_idx_uses_shared_base_logic(self):

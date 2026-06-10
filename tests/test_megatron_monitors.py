@@ -1,7 +1,9 @@
 import importlib
 import sys
 import unittest
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,23 +21,23 @@ MassiveActivationMonitor = importlib.import_module(
     "internal_medicine.backends.megatron.massive_activation_monitor"
 ).MassiveActivationMonitor
 MoESpecialistMonitor = importlib.import_module("internal_medicine.backends.megatron.moe_monitor").MoESpecialistMonitor
+moe_monitor_module = importlib.import_module("internal_medicine.backends.megatron.moe_monitor")
 PLEHealthMonitor = importlib.import_module("internal_medicine.backends.megatron.ple_monitor").PLEHealthMonitor
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
-
-
-class BrokenExperts:
-    @property
-    def weight1(self):
-        raise RuntimeError("expert weight read failed")
-
-
-class BrokenMoELayer:
-    experts = BrokenExperts()
-    shared_experts = None
+compute_sink_head_classification = importlib.import_module(
+    "internal_medicine.backends.megatron.sink_head_metrics"
+).compute_sink_head_classification
 
 
 class FakePLESublayer:
     act_fn = F.gelu
+
+
+class FakeMoELayer(nn.Module):
+    def __init__(self, experts):
+        super().__init__()
+        self.experts = experts
+        self.shared_experts = None
 
 
 class MegatronMoEMonitorTest(unittest.TestCase):
@@ -45,63 +47,55 @@ class MegatronMoEMonitorTest(unittest.TestCase):
     def tearDown(self):
         training_logs.reset()
 
-    def test_router_only_global_observation_is_counted_once(self):
+    def test_router_metrics_flush_from_gpu_buffer(self):
         monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
-        monitor._log_per_layer_metrics(0, {"router_entropy": 2.0})
-        monitor._accumulate_global({"router_entropy": 2.0})
-        monitor._pending_router_global_layers.add(0)
+        for name in moe_monitor_module._ROUTER_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
 
-        monitor._finalize_layer_observation(0)
-        self.assertEqual(monitor._global_count, 1)
-        self.assertEqual(monitor._pending_router_global_layers, set())
-
-        monitor.step()
-        latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/layer_0/router_entropy"], 2.0)
-        self.assertEqual(latest["moe_health/global_router_entropy"], 2.0)
-
-    def test_expert_only_and_router_plus_expert_count_one_observation_per_layer(self):
-        monitor = MoESpecialistMonitor(log_per_layer=False, log_global=True)
-
-        monitor._finalize_layer_observation(0, has_expert_metrics=True)
-        self.assertEqual(monitor._global_count, 1)
-
-        monitor._accumulate_global({"router_entropy": 2.0})
-        monitor._pending_router_global_layers.add(1)
-        monitor._accumulate_global({"expert_norm_mean": 4.0})
-        monitor._finalize_layer_observation(1, has_expert_metrics=True)
-        self.assertEqual(monitor._global_count, 2)
+        router = SimpleNamespace(
+            topk=2,
+            _cached_scores_for_aux_loss=torch.tensor(
+                [
+                    [0.7, 0.2, 0.1],
+                    [0.1, 0.6, 0.3],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        monitor._compute_router_metrics(0, router, None, None)
 
         monitor.step()
         latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/global_router_entropy"], 1.0)
-        self.assertEqual(latest["moe_health/global_expert_norm_mean"], 2.0)
+        self.assertIn("moe_health/layer_0/router_entropy", latest)
+        self.assertIn("moe_health/layer_0/score_sum_mean", latest)
+        self.assertIn("moe_health/global_router_entropy", latest)
+        self.assertIn("moe_health/global_score_sum_max", latest)
 
-    def test_step_finalizes_pending_router_metrics_before_flush(self):
-        monitor = MoESpecialistMonitor(log_per_layer=False, log_global=True)
-        monitor._accumulate_global({"router_entropy": 4.0})
-        monitor._pending_router_global_layers.add(3)
+    def test_step_computes_expert_metrics_even_under_no_grad(self):
+        monitor = MoESpecialistMonitor(log_per_layer=True, log_global=True)
+        for name in moe_monitor_module._EXPERT_METRICS:
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(torch.device("cpu"))
 
-        monitor.step()
+        hidden_size = 4
+        ffn_hidden = 8
+        num_experts = 2
+        experts = SimpleNamespace(
+            num_local_experts=num_experts,
+            config=SimpleNamespace(hidden_size=hidden_size),
+            weight1=torch.nn.Parameter(torch.ones(num_experts * hidden_size, ffn_hidden)),
+            weight2=torch.nn.Parameter(torch.ones(num_experts * ffn_hidden, hidden_size)),
+        )
+        moe_layer = FakeMoELayer(experts)
+        monitor._monitored_moe_layers = [(0, weakref.ref(moe_layer))]
+
+        with torch.no_grad():
+            monitor.step()
 
         latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/global_router_entropy"], 4.0)
-        self.assertEqual(monitor._global_count, 0)
-        self.assertEqual(monitor._pending_router_global_layers, set())
-
-    def test_expert_hook_exception_finalizes_pending_router_metrics(self):
-        monitor = MoESpecialistMonitor(log_per_layer=False, log_global=True, verbose=False)
-        monitor._accumulate_global({"router_entropy": 6.0})
-        monitor._pending_router_global_layers.add(2)
-
-        hook = monitor._make_moe_layer_hook(2, BrokenMoELayer())
-        hook(BrokenMoELayer(), (), None)
-
-        self.assertEqual(monitor._global_count, 1)
-        self.assertEqual(monitor._pending_router_global_layers, set())
-        monitor.step()
-        latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/global_router_entropy"], 6.0)
+        self.assertIn("moe_health/layer_0/expert_norm_mean", latest)
+        self.assertIn("moe_health/global_expert_norm_mean", latest)
 
 
 class MegatronPLEMonitorTest(unittest.TestCase):
@@ -126,8 +120,12 @@ class MegatronPLEMonitorTest(unittest.TestCase):
 
     def test_layer_hook_records_residual_and_gate_metrics_as_one_observation(self):
         monitor = PLEHealthMonitor(log_per_layer=True, log_global=True, gate_sparsity_threshold=0.01)
-        monitor._gate_out_buf[5] = torch.ones(2, 3, 4)
         hidden_states = torch.ones(2, 3, 4)
+        for name in ("residual_ratio", "gate_activation_mean", "gate_sparsity"):
+            monitor.declare_layer_metric(5, name)
+        monitor.allocate_buffers(hidden_states.device)
+
+        monitor._gate_out_buf[5] = torch.ones(2, 3, 4)
         output = hidden_states * 1.5
 
         hook = monitor._make_ple_layer_hook(5, FakePLESublayer())
@@ -161,8 +159,11 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
                 [[3.0, 1.0, -0.5, 2.0]],
             ]
         )
+        for name in monitor._layer_metric_names():
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers(hidden_states.device)
 
-        monitor._compute_and_log(0, hidden_states, nn.Module())
+        monitor._compute_residual_metrics(0, hidden_states)
         monitor.step()
 
         latest = training_logs.get_latest(prefix="massive_act")
@@ -182,6 +183,47 @@ class MegatronMassiveActivationMonitorTest(unittest.TestCase):
             self.assertIn(f"massive_act/global_{key}", latest)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_2"], 2.0)
         self.assertEqual(latest["massive_act/layer_0/channel_count_gt_3"], 1.0)
+
+
+class SinkHeadClassificationTest(unittest.TestCase):
+    """The gap computation is branchless to avoid a GPU->CPU sync on the hot
+    path (Python comparisons on a tensor sink_count would .item()). These cases
+    pin the branchless result against a readable branched reference.
+    """
+
+    THRESHOLD = 0.3
+
+    def _reference_gap(self, sink_per_head):
+        is_sink = sink_per_head > self.THRESHOLD
+        num_heads = sink_per_head.numel()
+        sink_count = int(is_sink.sum())
+        if 0 < sink_count < num_heads:
+            return (sink_per_head[is_sink].mean() - sink_per_head[~is_sink].mean()).item()
+        if sink_count == num_heads:
+            return sink_per_head.mean().item()
+        return 0.0
+
+    def _assert_gap(self, sink_per_head):
+        result = compute_sink_head_classification(sink_per_head, threshold=self.THRESHOLD)
+        self.assertAlmostEqual(result["sink_nonsink_gap"].item(), self._reference_gap(sink_per_head), places=5)
+
+    def test_mixed_sink_and_nonsink(self):
+        self._assert_gap(torch.tensor([0.5, 0.1, 0.8, 0.05]))
+
+    def test_all_heads_are_sinks(self):
+        self._assert_gap(torch.tensor([0.5, 0.6, 0.9]))
+
+    def test_no_sinks(self):
+        self._assert_gap(torch.tensor([0.1, 0.2, 0.05]))
+
+    def test_single_head(self):
+        self._assert_gap(torch.tensor([0.9]))
+        self._assert_gap(torch.tensor([0.1]))
+
+    def test_empty_input_is_zero(self):
+        result = compute_sink_head_classification(torch.tensor([]), threshold=self.THRESHOLD)
+        self.assertEqual(result["sink_nonsink_gap"].item(), 0.0)
+        self.assertEqual(result["sink_head_ratio"].item(), 0.0)
 
 
 if __name__ == "__main__":
