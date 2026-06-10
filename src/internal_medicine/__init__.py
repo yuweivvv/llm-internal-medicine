@@ -46,6 +46,7 @@ def setup_internal_medicine(
     monitor_interval: int = 1,
     verbose: bool = False,
     backend: str | None = None,
+    hook_timing_enabled: bool = False,
     **kwargs,
 ):
     """
@@ -57,12 +58,15 @@ def setup_internal_medicine(
             - 'qk_stats': QK attention statistics
             - 'moe_health': MoE health metrics
             - 'ple_health': PLE health (Megatron only)
-            - 'all': Enable all available monitors (default)
+            - 'massive_act': Massive activation metrics
+            - 'all': Enable all available monitors. None defaults to all.
         monitor_dict: Dict to store monitor instances
         monitor_interval: Steps between monitoring
         verbose: Print debug information
         backend: Force a specific backend ('megatron' or 'paddlefleet').
             Auto-detected if None.
+        hook_timing_enabled: Enable lightweight per-hook CPU wall-time diagnostics
+            for backends that support it.
         **kwargs: Per-monitor kwargs, keyed by monitor name.
             e.g. qk_stats={'causal': True}
 
@@ -76,5 +80,6 @@ def setup_internal_medicine(
         monitor_dict=monitor_dict,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        hook_timing_enabled=hook_timing_enabled,
         **kwargs,
     )

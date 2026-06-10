@@ -24,20 +24,53 @@ from .moe_metrics import (
 logger = logging.getLogger(__name__)
 
 
+_ROUTER_METRICS = (
+    "router_entropy",
+    "score_sum_mean",
+    "score_sum_min",
+    "score_sum_max",
+    "expert_bias_mean",
+    "expert_bias_std",
+    "bias_affinity_jaccard",
+)
+
+_EXPERT_METRICS = (
+    "expert_norm_mean",
+    "expert_norm_std",
+    "expert_norm_min",
+    "expert_norm_max",
+    "shared_expert_norm",
+    "shared_routed_ratio",
+)
+
+
 class MoESpecialistMonitor(TorchProbe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {"score_sum_max", "expert_norm_max"}
     MIN_AGGREGATED = {"score_sum_min", "expert_norm_min"}
 
-    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False, hook_timing_enabled=False
+    ):
         super().__init__(
-            log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
+            log_per_layer=log_per_layer,
+            log_global=log_global,
+            monitor_interval=monitor_interval,
+            verbose=verbose,
+            hook_timing_enabled=hook_timing_enabled,
         )
-        self.moe_layers: list[weakref.ref] = []
+        self._monitored_moe_layers: list[tuple[int, weakref.ref]] = []
         self._patched_routers: list[weakref.ref] = []
-        self._pending_router_global_layers: set[int] = set()
 
     def register_hooks(self, model: nn.Module):
+        self._init_parallel_state()
+        targets = self._prepare_layers(model)
+        if not targets:
+            return
+        self.allocate_buffers(next(model.parameters()).device)
+        self._attach_hooks(targets)
+
+    def _init_parallel_state(self):
         try:
             from megatron.core import parallel_state
 
@@ -46,31 +79,32 @@ class MoESpecialistMonitor(TorchProbe):
         except ImportError:
             pass
 
+    def _prepare_layers(self, model: nn.Module) -> list[tuple[int, nn.Module]]:
         moe_layers = self._find_moe_layers(model)
         if len(moe_layers) == 0:
             logger.warning("[MoEMonitor] No MoE layers found!")
-            return
+            return []
         if self.verbose:
             logger.info(f"[MoEMonitor] Found {len(moe_layers)} MoE layers.")
 
-        for layer_idx, moe_layer in moe_layers:
-            self.moe_layers.append(weakref.ref(moe_layer))
+        for layer_idx, _ in moe_layers:
+            for name in (*_ROUTER_METRICS, *_EXPERT_METRICS):
+                self.declare_layer_metric(layer_idx, name)
+        return moe_layers
+
+    def _attach_hooks(self, targets: list[tuple[int, nn.Module]]):
+        for layer_idx, moe_layer in targets:
+            self._monitored_moe_layers.append((layer_idx, weakref.ref(moe_layer)))
             if hasattr(moe_layer, "router"):
                 self._patch_router_cache(moe_layer.router)
-                hook = moe_layer.router.register_forward_hook(self._make_router_hook(layer_idx, moe_layer))
+                hook = moe_layer.router.register_forward_hook(
+                    self.timed_hook("router", self._make_router_hook(layer_idx, moe_layer))
+                )
                 self.hooks.append(hook)
-            hook = moe_layer.register_forward_hook(self._make_moe_layer_hook(layer_idx, moe_layer))
-            self.hooks.append(hook)
 
-        logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
+        logger.info(f"[MoEMonitor] Registered {len(self.hooks)} hooks on {len(targets)} layers.")
 
     def _patch_router_cache(self, router):
-        """Monkey-patch router._apply_aux_loss to intercept scores_for_aux_loss.
-
-        Inside routing(), compute_routing_scores_for_aux_loss is already called
-        and the result is passed to _apply_aux_loss. We intercept there to cache
-        the data with zero additional compute (just detach).
-        """
         if not hasattr(router, "_apply_aux_loss"):
             if self.verbose:
                 logger.warning("[MoEMonitor] Router has no _apply_aux_loss; router metrics may be unavailable")
@@ -151,58 +185,60 @@ class MoESpecialistMonitor(TorchProbe):
 
         return hook_fn
 
-    def _make_moe_layer_hook(self, layer_idx: int, _moe_layer: nn.Module):
-        def hook_fn(module, _inputs, _outputs):
-            if not self._should_monitor():
-                return
+    def _compute_expert_metrics_for_all_layers(self):
+        """Compute expert/shared norms once per step.
+
+        Expert weights are constant within a step (only optimizer.step() updates
+        them). Running this per microbatch on the forward stream queues kernels
+        that compete with EP a2a — see monitor-hook-perf-rules skill.
+        """
+        for layer_idx, moe_ref in self._monitored_moe_layers:
+            moe_layer = moe_ref()
+            if moe_layer is None:
+                continue
             try:
                 with torch.no_grad():
-                    self._compute_expert_metrics(layer_idx, module)
+                    self._compute_expert_metrics(layer_idx, moe_layer)
             except Exception as e:
-                self._finalize_layer_observation(layer_idx)
                 if self.verbose:
-                    logger.error(f"[MoEMonitor] MoE layer hook error layer {layer_idx}: {e}")
+                    logger.error(f"[MoEMonitor] Step expert-metric error layer {layer_idx}: {e}")
 
-        return hook_fn
+    def step(self):
+        # Bypass TorchProbe._should_monitor's torch.is_grad_enabled() guard:
+        # that guard exists to skip recompute-pass forward hooks, but step()
+        # runs outside any forward and a caller-side no_grad wrapper must not
+        # silently disable expert-weight metrics.
+        if self.step_count % self.monitor_interval == 0:
+            self._compute_expert_metrics_for_all_layers()
+        super().step()
 
     def _compute_router_metrics(self, layer_idx, router, outputs, _moe_layer):
-        metrics = {}
         topk = getattr(router, "topk", None)
         scores_for_aux_loss = getattr(router, "_cached_scores_for_aux_loss", None)
 
         if scores_for_aux_loss is not None:
-            metrics["router_entropy"] = compute_router_entropy(scores_for_aux_loss).item()
+            self.record_layer_metric(layer_idx, "router_entropy", compute_router_entropy(scores_for_aux_loss))
             if topk is not None:
-                score_sum_stats = compute_topk_score_sum(scores_for_aux_loss, topk)
-                metrics["score_sum_mean"] = score_sum_stats["score_sum_mean"].item()
-                metrics["score_sum_min"] = score_sum_stats["score_sum_min"].item()
-                metrics["score_sum_max"] = score_sum_stats["score_sum_max"].item()
+                stats = compute_topk_score_sum(scores_for_aux_loss, topk)
+                self.record_layer_metric(layer_idx, "score_sum_mean", stats["score_sum_mean"])
+                self.record_layer_metric(layer_idx, "score_sum_min", stats["score_sum_min"])
+                self.record_layer_metric(layer_idx, "score_sum_max", stats["score_sum_max"])
 
         if hasattr(router, "expert_bias") and router.expert_bias is not None:
-            metrics["expert_bias_mean"] = router.expert_bias.mean().item()
-            metrics["expert_bias_std"] = router.expert_bias.std().item()
+            self.record_layer_metric(layer_idx, "expert_bias_mean", router.expert_bias.mean())
+            self.record_layer_metric(layer_idx, "expert_bias_std", router.expert_bias.std())
 
         routing_map_for_aux_loss = getattr(router, "_cached_routing_map_for_aux_loss", None)
         if routing_map_for_aux_loss is not None and isinstance(outputs, tuple) and len(outputs) >= 2:
             routing_after = outputs[1]
-            jaccard = compute_bias_affinity_jaccard(routing_map_for_aux_loss, routing_after)
-            metrics["bias_affinity_jaccard"] = jaccard.item()
-
-        # Per-layer log + global accumulate (no count increment — expert hook does that)
-        self._log_per_layer_metrics(layer_idx, metrics)
-        if self.log_global and metrics:
-            self._accumulate_global(metrics)
-            self._pending_router_global_layers.add(layer_idx)
-
-    def _finalize_layer_observation(self, layer_idx: int, *, has_expert_metrics: bool = False):
-        """Finish one MoE layer observation and count global aggregation once."""
-        has_pending_router = layer_idx in self._pending_router_global_layers
-        if has_expert_metrics or has_pending_router:
-            self._count_global_observation()
-        self._pending_router_global_layers.discard(layer_idx)
+            num_experts = getattr(router, "num_experts", None) or getattr(router, "num_moe_experts", None)
+            jaccard = compute_bias_affinity_jaccard(routing_map_for_aux_loss, routing_after, num_experts=num_experts)
+            self.record_layer_metric(layer_idx, "bias_affinity_jaccard", jaccard)
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
-        metrics = {}
+        # expert_norm_mean aggregates only this rank's local experts; the
+        # flush-time global is correct across EP only when each rank holds
+        # the same number of local experts (the typical EP layout).
         routed_norm_mean = None
 
         if hasattr(moe_layer, "experts") and moe_layer.experts is not None:
@@ -231,27 +267,21 @@ class MoESpecialistMonitor(TorchProbe):
                         expert_weights.append(torch.cat(weights))
 
             if expert_weights:
-                norm_stats = compute_expert_norms(expert_weights)
-                metrics["expert_norm_mean"] = norm_stats["expert_norm_mean"].item()
-                metrics["expert_norm_std"] = norm_stats["expert_norm_std"].item()
-                metrics["expert_norm_min"] = norm_stats["expert_norm_min"].item()
-                metrics["expert_norm_max"] = norm_stats["expert_norm_max"].item()
-                routed_norm_mean = norm_stats["expert_norm_mean"]
+                stats = compute_expert_norms(expert_weights)
+                self.record_layer_metric(layer_idx, "expert_norm_mean", stats["expert_norm_mean"])
+                self.record_layer_metric(layer_idx, "expert_norm_std", stats["expert_norm_std"])
+                self.record_layer_metric(layer_idx, "expert_norm_min", stats["expert_norm_min"])
+                self.record_layer_metric(layer_idx, "expert_norm_max", stats["expert_norm_max"])
+                routed_norm_mean = stats["expert_norm_mean"]
 
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
             shared_weights = [p.data for p in moe_layer.shared_experts.parameters()]
             if shared_weights:
                 shared_norm = compute_shared_expert_norm(shared_weights)
-                metrics["shared_expert_norm"] = shared_norm.item()
+                self.record_layer_metric(layer_idx, "shared_expert_norm", shared_norm)
                 if routed_norm_mean is not None:
-                    ratio = compute_shared_routed_ratio(shared_norm, routed_norm_mean.clone().detach())
-                    metrics["shared_routed_ratio"] = ratio.item()
-
-        if metrics:
-            self._log_per_layer_metrics(layer_idx, metrics)
-            if self.log_global:
-                self._accumulate_global(metrics)
-        self._finalize_layer_observation(layer_idx, has_expert_metrics=bool(metrics))
+                    ratio = compute_shared_routed_ratio(shared_norm, routed_norm_mean)
+                    self.record_layer_metric(layer_idx, "shared_routed_ratio", ratio)
 
     def remove_hooks(self):
         super().remove_hooks()
@@ -270,19 +300,12 @@ class MoESpecialistMonitor(TorchProbe):
             ):
                 if hasattr(router, attr):
                     delattr(router, attr)
-        self.moe_layers = []
+        self._monitored_moe_layers = []
         self._patched_routers = []
-        self._pending_router_global_layers.clear()
-
-    def step(self):
-        for layer_idx in list(self._pending_router_global_layers):
-            self._finalize_layer_observation(layer_idx)
-        super().step()
-        self._pending_router_global_layers.clear()
 
     def get_health_summary(self) -> dict[str, Any]:
         metrics = training_logs.get_latest(prefix="moe_health")
-        summary = {"num_layers_monitored": len(self.moe_layers), "total_steps": self.step_count}
+        summary = {"num_layers_monitored": len(self._monitored_moe_layers), "total_steps": self.step_count}
         for key, val in metrics.items():
             if "bias_affinity_jaccard" in key:
                 summary["router_conflict"] = "SEVERE" if val < 0.3 else "WARNING" if val < 0.7 else "OK"
@@ -297,6 +320,7 @@ def setup_moe_monitor(
     log_global=True,
     monitor_interval=1,
     verbose=False,
+    hook_timing_enabled=False,
     monitor_dict=None,
 ):
     monitor = MoESpecialistMonitor(
@@ -304,10 +328,19 @@ def setup_moe_monitor(
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        hook_timing_enabled=hook_timing_enabled,
     )
     models = [model] if not isinstance(model, list) else model
+    monitor._init_parallel_state()
+    chunk_targets = []
     for m in models:
-        monitor.register_hooks(m)
+        chunk_targets.append((m, monitor._prepare_layers(m)))
+    if any(targets for _, targets in chunk_targets):
+        device = next((p.device for m in models for p in m.parameters()), None)
+        assert device is not None, "no parameters across model chunks; cannot pick a device"
+        monitor.allocate_buffers(device)
+        for _, targets in chunk_targets:
+            monitor._attach_hooks(targets)
     logger.info(f"[MoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
     if monitor_dict is not None:
         monitor_dict["moe_health"] = monitor

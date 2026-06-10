@@ -55,6 +55,7 @@ def compute_topk_score_sum(scores: torch.Tensor, topk: int) -> dict[str, torch.T
 def compute_bias_affinity_jaccard(
     routing_map_before_bias: torch.Tensor,
     routing_map_after_bias: torch.Tensor,
+    num_experts: int | None = None,
 ) -> torch.Tensor:
     """
     计算 Bias-Affinity Jaccard 相似度.
@@ -62,20 +63,23 @@ def compute_bias_affinity_jaccard(
     Jaccard(A, B) = |A ∩ B| / |A ∪ B|
 
     Args:
-        routing_map_before_bias: Bias前的routing map [tokens, topk] 或 [tokens, num_experts]
-        routing_map_after_bias: Bias后的routing map
+        routing_map_before_bias: Bias前的routing map [tokens, topk] (index form)
+            or [tokens, num_experts] (one-hot/bool form).
+        routing_map_after_bias: Bias后的routing map.
+        num_experts: required when routing_map is in index form (last dim == topk).
+            Pass router.num_experts. Avoids a D2H sync on the hot path.
 
     Returns:
         jaccard: Jaccard相似度 (0-1)
     """
     if routing_map_before_bias.dim() == 2:
-        is_onehot = routing_map_before_bias.unique().numel() <= 2
+        is_onehot = routing_map_before_bias.shape[-1] != 1 and routing_map_before_bias.dtype in (
+            torch.bool,
+            torch.uint8,
+        )
 
-        if not is_onehot:
-            # expert indices -> one-hot
+        if not is_onehot and num_experts is not None and routing_map_before_bias.dtype not in (torch.bool, torch.uint8):
             num_tokens, topk = routing_map_before_bias.shape
-            num_experts = int(max(routing_map_before_bias.max().item(), routing_map_after_bias.max().item())) + 1
-
             before_onehot = torch.zeros(
                 num_tokens, num_experts, device=routing_map_before_bias.device, dtype=torch.bool
             )

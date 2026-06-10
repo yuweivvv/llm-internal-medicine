@@ -71,10 +71,10 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         "mean_per_head": mean_logits,
         "entropy_per_head": entropy,
         "sink_per_head": sink,
-        "max_global": max_logits.max().item(),
-        "mean_global": mean_logits.mean().item(),
-        "entropy_global": entropy.mean().item(),
-        "sink_global": sink.mean().item(),
+        "max_global": max_logits.max(),
+        "mean_global": mean_logits.mean(),
+        "entropy_global": entropy.mean(),
+        "sink_global": sink.mean(),
     }
 
 
@@ -128,10 +128,10 @@ def compute_qk_stats_pytorch(q: torch.Tensor, k: torch.Tensor, causal: bool = Tr
         "mean_per_head": mean_per_head,
         "entropy_per_head": avg_entropy,
         "sink_per_head": avg_sink,
-        "max_global": max_per_head.max().item(),
-        "mean_global": mean_per_head.mean().item(),
-        "entropy_global": avg_entropy.mean().item(),
-        "sink_global": avg_sink.mean().item(),
+        "max_global": max_per_head.max(),
+        "mean_global": mean_per_head.mean(),
+        "entropy_global": avg_entropy.mean(),
+        "sink_global": avg_sink.mean(),
     }
 
 

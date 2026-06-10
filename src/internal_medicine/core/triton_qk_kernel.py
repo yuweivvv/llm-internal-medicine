@@ -89,7 +89,7 @@ def qk_stats_kernel(
                 k_ptr = k_base + n_offsets[:, None] * stride_k_seq + k_offsets[None, :] * stride_k_dim
                 k = tl.load(k_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
 
-                acc += tl.dot(q, tl.trans(k))
+                acc += tl.dot(q, tl.trans(k), input_precision="ieee")
 
             logits = acc * scale
 

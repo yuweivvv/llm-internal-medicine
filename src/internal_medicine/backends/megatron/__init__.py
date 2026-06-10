@@ -22,6 +22,7 @@ _MONITOR_MAP = {
 def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
     """Setup all requested monitors on a Megatron model."""
     install_gather_fn()
+    hook_timing_enabled = bool(kwargs.pop("hook_timing_enabled", False))
 
     if monitors is None:
         monitors = ["all"]
@@ -40,6 +41,7 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
                 monitor_dict=monitor_dict,
                 monitor_interval=monitor_interval,
                 verbose=verbose,
+                hook_timing_enabled=hook_timing_enabled,
                 **kwargs.get(name, {}),
             )
             logger.info(f"[InternalMedicine/megatron] Enabled monitor: {name}")

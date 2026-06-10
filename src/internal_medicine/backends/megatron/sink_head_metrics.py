@@ -57,21 +57,23 @@ def compute_sink_head_classification(
     is_sink = sink_per_head > threshold
     num_heads = sink_per_head.numel()
     sink_count = is_sink.sum().float()
+    nonsink_count = num_heads - sink_count
+    is_sink_f = is_sink.to(sink_per_head.dtype)
 
     sink_head_ratio = sink_count / num_heads
     sink_head_max = sink_per_head.max()
 
-    # Compute gap between sink and non-sink heads
-    if sink_count > 0 and sink_count < num_heads:
-        sink_mean = sink_per_head[is_sink].mean()
-        nonsink_mean = sink_per_head[~is_sink].mean()
-        gap = sink_mean - nonsink_mean
-    elif sink_count == num_heads:
-        # All heads are sinks — gap is vs 0
-        gap = sink_per_head.mean()
-    else:
-        # No sinks — gap is 0
-        gap = torch.tensor(0.0, device=sink_per_head.device)
+    # Keep this branchless: Python comparisons on GPU tensors would sync.
+    sink_mean = (sink_per_head * is_sink_f).sum() / sink_count.clamp_min(1.0)
+    nonsink_mean = (sink_per_head * (1.0 - is_sink_f)).sum() / nonsink_count.clamp_min(1.0)
+    mixed_gap = sink_mean - nonsink_mean
+    all_sink_gap = sink_per_head.mean()
+    zero = torch.zeros((), device=sink_per_head.device, dtype=sink_per_head.dtype)
+    gap = torch.where(
+        sink_count == 0,
+        zero,
+        torch.where(sink_count == num_heads, all_sink_gap, mixed_gap),
+    )
 
     return {
         "sink_head_ratio": sink_head_ratio,

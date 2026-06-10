@@ -37,6 +37,7 @@ import paddle.nn as nn
 from .base import PaddleProbe
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
+    _threshold_key,
     compute_activation_scale_stats,
     compute_per_channel_max,
     compute_post_norm_cosine_stability,
@@ -63,6 +64,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         "channel_max_ratio",
         "topk_channel_norm",
         "activation_rms",
+        "massive_act_channel_count",
     }
 
     def __init__(
@@ -90,6 +92,9 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         self.cosine_sample_pairs = cosine_sample_pairs
         self.sample_layers = set(sample_layers) if sample_layers else None
         self.absolute_thresholds = tuple(absolute_thresholds)
+        self.MAX_AGGREGATED = self.MAX_AGGREGATED | {
+            f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds
+        }
         self.tp_size = 1
         self.tp_group = None
         self._warned_per_channel_aggregate = False

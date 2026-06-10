@@ -1,4 +1,11 @@
-"""Base class for all monitors (probes)."""
+"""Base class for all monitors (probes) — backend-agnostic.
+
+This module deliberately does not import ``torch`` or ``paddle``. The GPU-buffer
+recording API (declare_*/record_*/allocate_buffers/_flush_gpu_buffer) lives in
+backend-specific subclasses (e.g. ``backends/megatron/base.py:TorchProbe``).
+The legacy CPU-float ``_record_metrics`` API lives here for backends that have
+not migrated.
+"""
 
 from abc import ABC, abstractmethod
 
@@ -6,11 +13,16 @@ from .training_logs import training_logs
 
 
 class Probe(ABC):
-    """Base class shared by all backend-specific monitors.
+    """Backend-agnostic probe lifecycle and legacy CPU-float metrics.
 
-    Subclasses set METRIC_PREFIX plus aggregation overrides, then call
-    _record_metrics() from their hooks. Global aggregation and
-    flushing are handled here automatically.
+    Subclasses add backend-specific recording APIs. The Megatron backend's
+    ``TorchProbe`` adds the GPU-buffer API (zero-D tensor accumulators flushed
+    once per step). Paddle backends currently only use the legacy
+    ``_record_metrics`` path defined here.
+
+    Class-level ``MAX_AGGREGATED`` / ``MIN_AGGREGATED`` sets classify metric
+    *names* (without the layer/global prefix) so both APIs agree on whether a
+    metric reduces by max, min, or mean across layers and ranks.
     """
 
     METRIC_PREFIX: str = ""
@@ -38,11 +50,23 @@ class Probe(ABC):
 
     def step(self):
         self.step_count += 1
+        self._flush_buffers()
         if self.log_global and self._global_accum:
             self._flush_global_metrics()
 
+    def _flush_buffers(self) -> None:
+        """Hook for backend-specific batched flush. Default: no-op.
+
+        ``TorchProbe`` overrides this to D2H-flush its GPU accumulators.
+        """
+        return None
+
     def _should_monitor(self) -> bool:
         return self.step_count % self.monitor_interval == 0
+
+    # ------------------------------------------------------------------
+    # Legacy CPU-float API
+    # ------------------------------------------------------------------
 
     def _record_metrics(self, layer_idx: int, metrics: dict[str, float]):
         """Log per-layer metrics and accumulate for global aggregation.
@@ -78,11 +102,7 @@ class Probe(ABC):
                 self._global_accum[name] = self._global_accum.get(name, 0.0) + val
 
     def _is_max_aggregated(self, name: str) -> bool:
-        return (
-            name in self.MAX_AGGREGATED
-            or name == "massive_act_channel_count"
-            or name.startswith("channel_count_gt_")
-        )
+        return name in self.MAX_AGGREGATED
 
     def _count_global_observation(self):
         """Count one complete layer observation for global averages."""

@@ -81,8 +81,8 @@ def summarize_per_channel_max(
     }
     for absolute_threshold in absolute_thresholds:
         metrics[f"channel_count_gt_{_threshold_key(absolute_threshold)}"] = (
-            per_channel_max > absolute_threshold
-        ).sum().float()
+            (per_channel_max > absolute_threshold).sum().float()
+        )
     return metrics
 
 
