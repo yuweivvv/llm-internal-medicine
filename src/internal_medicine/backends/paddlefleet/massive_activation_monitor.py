@@ -35,6 +35,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
+from .layer_discovery import get_decoder_layers, iter_monitor_layers
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
@@ -118,11 +119,24 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         except Exception:
             pass
 
-        layers = self._get_decoder_layers(model)
+        def is_transformer_layer(layer):
+            return hasattr(layer, "self_attn") or hasattr(layer, "self_attention") or hasattr(layer, "input_layernorm")
+
+        layers = get_decoder_layers(model)
+        if layers is None:
+            transformer_layers = [
+                sublayer for _name, sublayer in model.named_sublayers() if is_transformer_layer(sublayer)
+            ]
+            layers = transformer_layers if transformer_layers else None
         if not layers:
             logger.warning("[MassiveActMonitor] No transformer layers found!")
             return
-        layers = list(layers)
+
+        monitor_layers = iter_monitor_layers(
+            layers, 
+            is_transformer_layer, 
+            pp_rank=self.pp_rank
+        )
 
         # Declare metric schema
         metric_names = [
@@ -139,50 +153,22 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         ] + [f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds]
 
         registered = 0
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-            if self.sample_layers and global_idx not in self.sample_layers:
+        for item in monitor_layers:
+            if self.sample_layers and item.idx not in self.sample_layers:
                 continue
             for m in metric_names:
-                self.declare_layer_metric(global_idx, m)
+                self.declare_layer_metric(item.idx, m)
             registered += 1
 
         self.allocate_buffers()
 
-        idx = 0
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-            if self.sample_layers and global_idx not in self.sample_layers:
+        for item in monitor_layers:
+            if self.sample_layers and item.idx not in self.sample_layers:
                 continue
-            hook = layer.register_forward_pre_hook(self._make_residual_hook(global_idx))
+            hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx))
             self.hooks.append(hook)
-            idx += 1
 
         logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
-
-    def _get_decoder_layers(self, model):
-        """Find transformer decoder layers in PaddleFleet model hierarchy."""
-        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-            model = model._layers
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "run_function"):
-            return [
-                layer
-                for layer in model.run_function
-                if hasattr(layer, "self_attn") or hasattr(layer, "self_attention") or hasattr(layer, "input_layernorm")
-            ]
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        transformer_layers = []
-        for _name, sublayer in model.named_sublayers():
-            if hasattr(sublayer, "self_attn") or hasattr(sublayer, "self_attention"):
-                transformer_layers.append(sublayer)
-        return transformer_layers if transformer_layers else None
 
     def _make_residual_hook(self, layer_idx: int):
         def hook_fn(module, inputs):

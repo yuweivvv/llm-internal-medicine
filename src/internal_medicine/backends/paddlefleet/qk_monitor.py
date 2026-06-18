@@ -11,6 +11,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
+from .layer_discovery import get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
 
@@ -241,37 +242,29 @@ class PaddleQKStatsMonitor(PaddleProbe):
         logger.info(f"[PaddleQKMonitor] Registered {len(self.hooks)} hooks.")
 
     def _find_attention_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
-        attention_layers = []
-        layers = self._get_decoder_layers(model)
+        def has_attention(layer):
+            return hasattr(layer, "self_attn") or hasattr(layer, "self_attention")
+
+        layers = get_decoder_layers(model)
+        if layers is None:
+            transformer_layers = [
+                sublayer for _name, sublayer in model.named_sublayers() if has_attention(sublayer)
+            ]
+            layers = transformer_layers if transformer_layers else None
         if layers is None:
             return []
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-            attn = getattr(layer, "self_attn", None) or getattr(layer, "self_attention", None)
-            if attn is not None:
-                attention_layers.append((global_idx, attn))
-        return attention_layers
 
-    def _get_decoder_layers(self, model):
-        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-            model = model._layers
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "run_function"):
-            return [
-                layer for layer in model.run_function if hasattr(layer, "self_attn") or hasattr(layer, "self_attention")
-            ]
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        transformer_layers = []
-        for _name, sublayer in model.named_sublayers():
-            if hasattr(sublayer, "self_attn") or hasattr(sublayer, "self_attention"):
-                transformer_layers.append(sublayer)
-        return transformer_layers if transformer_layers else None
+        monitor_layers = iter_monitor_layers(
+            layers,
+            has_attention,
+            pp_rank=self.pp_rank,
+        )
+        attention_layers = []
+        for item in monitor_layers:
+            attn = getattr(item.layer, "self_attn", None) or getattr(item.layer, "self_attention", None)
+            if attn is not None:
+                attention_layers.append((item.idx, attn))
+        return attention_layers
 
     def _make_compute_hook(self, layer_idx: int):
         def hook_fn(layer, inputs):
