@@ -101,10 +101,10 @@ def _compute_qk_stats_triton(q: paddle.Tensor, k: paddle.Tensor, causal: bool = 
         "mean_per_head": mean_logits,
         "entropy_per_head": entropy,
         "sink_per_head": sink,
-        "max_global": float(max_logits.max()),
-        "mean_global": float(mean_logits.mean()),
-        "entropy_global": float(entropy.mean()),
-        "sink_global": float(sink.mean()),
+        "max_global": max_logits.max(),
+        "mean_global": mean_logits.mean(),
+        "entropy_global": entropy.mean(),
+        "sink_global": sink.mean(),
     }
 
 
@@ -163,6 +163,12 @@ class PaddleQKStatsMonitor(PaddleProbe):
         if self.verbose:
             logger.info(f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size}")
 
+        for layer_idx, _ in attention_layers:
+            for m in ("max", "mean", "entropy_avg", "sink", "entropy_min", "entropy_max", "entropy_std"):
+                self.declare_layer_metric(layer_idx, m)
+
+        self.allocate_buffers()
+
         for layer_idx, attn_module in attention_layers:
             if hasattr(attn_module, "core_attention"):
                 hook = attn_module.core_attention.register_forward_pre_hook(self._make_compute_hook(layer_idx))
@@ -212,24 +218,19 @@ class PaddleQKStatsMonitor(PaddleProbe):
             try:
                 query, key = inputs[0], inputs[1]
                 with paddle.no_grad():
-                    # Handle GQA
                     if query.shape[2] != key.shape[2]:
                         heads_per_group = query.shape[2] // key.shape[2]
                         key = key.repeat_interleave(heads_per_group, axis=2)
                     stats = compute_qk_stats_paddle(query, key, causal=self.causal)
 
                 all_heads = stats["entropy_per_head"]
-                metrics = {
-                    "max": stats["max_global"],
-                    "mean": stats["mean_global"],
-                    "entropy_avg": stats["entropy_global"],
-                    "sink": stats["sink_global"],
-                    "entropy_min": float(all_heads.min()),
-                    "entropy_max": float(all_heads.max()),
-                    "entropy_std": float(all_heads.std()),
-                }
-
-                self._record_metrics(layer_idx, metrics)
+                self.record_layer_metric(layer_idx, "max", stats["max_global"])
+                self.record_layer_metric(layer_idx, "mean", stats["mean_global"])
+                self.record_layer_metric(layer_idx, "entropy_avg", stats["entropy_global"])
+                self.record_layer_metric(layer_idx, "sink", stats["sink_global"])
+                self.record_layer_metric(layer_idx, "entropy_min", all_heads.min())
+                self.record_layer_metric(layer_idx, "entropy_max", all_heads.max())
+                self.record_layer_metric(layer_idx, "entropy_std", all_heads.std())
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 
