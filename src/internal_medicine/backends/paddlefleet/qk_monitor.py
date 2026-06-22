@@ -15,6 +15,44 @@ from .base import PaddleProbe
 logger = logging.getLogger(__name__)
 
 
+def compute_sink_head_classification(sink_per_head: paddle.Tensor, threshold: float = 0.3) -> dict:
+    """Classify attention heads as sink vs non-sink.
+
+    Mirrors the megatron-side ``sink_head_metrics.compute_sink_head_classification``
+    using paddle ops. ``sink_per_head`` is a 1-D tensor of length num_heads
+    holding the mean attention weight on token-0 per head (already averaged
+    across batch).
+
+    Returns a dict with three scalars (python floats):
+        sink_head_ratio  — fraction of heads with sink weight > threshold
+        sink_head_max    — max sink weight across heads
+        sink_nonsink_gap — mean(sink) - mean(non-sink); 0 if no sinks; mean if all sinks
+    """
+    num_heads = int(sink_per_head.numel())
+    if num_heads == 0:
+        return {"sink_head_ratio": 0.0, "sink_head_max": 0.0, "sink_nonsink_gap": 0.0}
+
+    is_sink = sink_per_head > threshold
+    sink_count = int(is_sink.sum())
+    sink_head_ratio = sink_count / num_heads
+    sink_head_max = float(sink_per_head.max())
+
+    if 0 < sink_count < num_heads:
+        sink_mean = float(sink_per_head[is_sink].mean())
+        nonsink_mean = float(sink_per_head[~is_sink].mean())
+        gap = sink_mean - nonsink_mean
+    elif sink_count == num_heads:
+        gap = float(sink_per_head.mean())
+    else:
+        gap = 0.0
+
+    return {
+        "sink_head_ratio": sink_head_ratio,
+        "sink_head_max": sink_head_max,
+        "sink_nonsink_gap": gap,
+    }
+
+
 _triton_driver_patched = False
 
 
@@ -127,16 +165,25 @@ def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = T
 
 class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
-    MAX_AGGREGATED = {"max", "entropy_max"}
+    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
     MIN_AGGREGATED = {"entropy_min"}
 
-    def __init__(self, causal=True, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        causal=True,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        sink_head_threshold: float = 0.3,
+    ):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.causal = causal
         self.tp_size = 1
         self.pp_rank = 0
+        self.sink_head_threshold = sink_head_threshold
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -219,6 +266,11 @@ class PaddleQKStatsMonitor(PaddleProbe):
                     stats = compute_qk_stats_paddle(query, key, causal=self.causal)
 
                 all_heads = stats["entropy_per_head"]
+                # sink_per_head: [B, H] — average across batch to get [H]
+                sink_per_head = stats["sink_per_head"]
+                sink_for_classify = sink_per_head.mean(axis=0) if sink_per_head.ndim > 1 else sink_per_head
+                sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
+
                 metrics = {
                     "max": stats["max_global"],
                     "mean": stats["mean_global"],
@@ -227,6 +279,9 @@ class PaddleQKStatsMonitor(PaddleProbe):
                     "entropy_min": float(all_heads.min()),
                     "entropy_max": float(all_heads.max()),
                     "entropy_std": float(all_heads.std()),
+                    "sink_head_ratio": sink_class["sink_head_ratio"],
+                    "sink_head_max": sink_class["sink_head_max"],
+                    "sink_nonsink_gap": sink_class["sink_nonsink_gap"],
                 }
 
                 self._record_metrics(layer_idx, metrics)
@@ -243,6 +298,7 @@ def setup_qk_monitor(
     log_per_layer=True,
     log_global=True,
     monitor_interval=1,
+    sink_head_threshold: float = 0.3,
     monitor_dict=None,
 ):
     monitor = PaddleQKStatsMonitor(
@@ -251,6 +307,7 @@ def setup_qk_monitor(
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        sink_head_threshold=sink_head_threshold,
     )
     monitor.register_hooks(model)
     logger.info(f"[PaddleQKMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
