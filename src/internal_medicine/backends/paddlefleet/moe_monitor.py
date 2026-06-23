@@ -87,6 +87,27 @@ def _compute_expert_norms_paddle(weight_list):
     }
 
 
+def _safe_flatten_weight(weight):
+    try:
+        return weight.detach().flatten()
+    except Exception:
+        return None
+
+
+def _safe_concat_weights(weights):
+    flattened = []
+    for weight in weights:
+        flat_weight = _safe_flatten_weight(weight)
+        if flat_weight is not None:
+            flattened.append(flat_weight)
+    if not flattened:
+        return None
+    try:
+        return paddle.concat(flattened)
+    except Exception:
+        return None
+
+
 class PaddleMoEMonitor(PaddleProbe):
     METRIC_PREFIX = "moe_health"
     MAX_AGGREGATED = {"score_sum_max", "expert_norm_max", "expert_bias_max"}
@@ -329,8 +350,13 @@ class PaddleMoEMonitor(PaddleProbe):
                 w2 = ggm.weight2
                 num_experts = w1.shape[0]
                 for i in range(num_experts):
-                    combined = paddle.concat([w1[i].flatten(), w2[i].flatten()])
-                    expert_weights.append(combined)
+                    try:
+                        expert_parts = [w1[i], w2[i]]
+                    except Exception:
+                        continue
+                    combined = _safe_concat_weights(expert_parts)
+                    if combined is not None:
+                        expert_weights.append(combined)
             if expert_weights:
                 norm_stats = _compute_expert_norms_paddle(expert_weights)
                 metrics.update(norm_stats)
@@ -340,18 +366,17 @@ class PaddleMoEMonitor(PaddleProbe):
             expert_weights = []
             for expert in moe_layer.experts:
                 if expert is not None:
-                    weights = [p.flatten() for p in expert.parameters()]
-                    if weights:
-                        expert_weights.append(paddle.concat(weights))
+                    combined = _safe_concat_weights(expert.parameters())
+                    if combined is not None:
+                        expert_weights.append(combined)
             if expert_weights:
                 norm_stats = _compute_expert_norms_paddle(expert_weights)
                 metrics.update(norm_stats)
                 routed_norm_mean = norm_stats["expert_norm_mean"]
 
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
-            shared_weights = [p.flatten() for p in moe_layer.shared_experts.parameters()]
-            if shared_weights:
-                all_params = paddle.concat(shared_weights)
+            all_params = _safe_concat_weights(moe_layer.shared_experts.parameters())
+            if all_params is not None:
                 shared_norm = float(all_params.astype("float32").norm())
                 metrics["shared_expert_norm"] = shared_norm
                 if routed_norm_mean is not None and routed_norm_mean > 1e-8:
