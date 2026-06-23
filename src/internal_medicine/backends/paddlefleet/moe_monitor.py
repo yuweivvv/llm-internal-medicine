@@ -21,6 +21,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
+from .layer_discovery import get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
 
@@ -221,16 +222,26 @@ class PaddleMoEMonitor(PaddleProbe):
         self._patched_gates.append(gate)
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
-        moe_layers = []
-        layers = self._get_decoder_layers(model)
+        def has_moe(layer):
+            return (
+                (hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"))
+                or hasattr(layer, "moe")
+                or hasattr(layer, "gate")
+            )
+
+        layers = get_decoder_layers(model)
         if layers is None:
             for _name, sublayer in model.named_sublayers():
                 if sublayer.__class__.__name__ == "MoELayer":
-                    moe_layers.append((len(moe_layers), sublayer))
-            return moe_layers
+                    layers = [] if layers is None else layers
+                    layers.append(sublayer)
+            if layers is None:
+                return []
 
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
+        monitor_layers = iter_monitor_layers(layers, has_moe, pp_rank=self.pp_rank)
+        moe_layers = []
+        for item in monitor_layers:
+            layer = item.layer
             moe_module = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
                 moe_module = layer.mlp
@@ -239,39 +250,8 @@ class PaddleMoEMonitor(PaddleProbe):
             elif hasattr(layer, "gate"):
                 moe_module = layer
             if moe_module is not None:
-                moe_layers.append((global_idx, moe_module))
+                moe_layers.append((item.idx, moe_module))
         return moe_layers
-
-    def _get_decoder_layers(self, model):
-        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-            model = model._layers
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "run_function"):
-            return [
-                layer
-                for layer in model.run_function
-                if hasattr(layer, "self_attn")
-                or hasattr(layer, "self_attention")
-                or (hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"))
-                or hasattr(layer, "moe")
-            ]
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        transformer_layers = []
-        for _name, sublayer in model.named_sublayers():
-            if (
-                hasattr(sublayer, "self_attn")
-                or hasattr(sublayer, "self_attention")
-                or (hasattr(sublayer, "mlp") and hasattr(sublayer.mlp, "gate"))
-                or hasattr(sublayer, "moe")
-            ):
-                transformer_layers.append(sublayer)
-        return transformer_layers if transformer_layers else None
 
     def _make_gate_hook(self, layer_idx: int, moe_layer: nn.Layer):
         def hook_fn(layer, inputs, outputs):
