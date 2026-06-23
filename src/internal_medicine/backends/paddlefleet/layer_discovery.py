@@ -15,20 +15,48 @@ class MonitorLayer:
     is_mtp: bool = False
 
 
+def _flatten_model_chunks(model) -> list[object] | None:
+    """Return flattened run_function entries from PaddleFleet VPP chunks."""
+    chunks = getattr(model, "_model_chunks", None)
+    if not chunks:
+        return None
+
+    layers = []
+    for chunk in chunks:
+        chunk_layers = get_decoder_layers(chunk)
+        if chunk_layers is not None:
+            layers.extend(chunk_layers)
+    return layers if layers else None
+
+
 def get_decoder_layers(model) -> list[object] | None:
-    """Find PaddleFleet decoder layers, including MTP wrapper layers."""
-    if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-        model = model._layers
+    """Find PaddleFleet decoder layers, including VPP chunks and MTP wrappers."""
+    candidates = [model]
+    if hasattr(model, "_layers"):
+        candidates.append(model._layers)
     if hasattr(model, "module"):
-        model = model.module
-    if hasattr(model, "run_function"):
-        return list(model.run_function)
-    if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-        return list(model.decoder.layers)
-    if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-        return list(model.encoder.layers)
-    if hasattr(model, "layers"):
-        return list(model.layers)
+        candidates.append(model.module)
+
+    seen = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+
+        chunk_layers = _flatten_model_chunks(candidate)
+        if chunk_layers is not None:
+            return chunk_layers
+        if hasattr(candidate, "run_function"):
+            return list(candidate.run_function)
+        if hasattr(candidate, "decoder") and hasattr(candidate.decoder, "layers"):
+            return list(candidate.decoder.layers)
+        if hasattr(candidate, "encoder") and hasattr(candidate.encoder, "layers"):
+            return list(candidate.encoder.layers)
+        if hasattr(candidate, "layers"):
+            return list(candidate.layers)
     return None
 
 

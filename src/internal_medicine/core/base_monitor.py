@@ -38,6 +38,7 @@ class Probe(ABC):
         self.step_count = 0
         self.pp_rank = 0
         self._global_accum: dict[str, float] = {}
+        self._global_metric_counts: dict[str, int] = {}
         self._global_count: int = 0
 
     @abstractmethod
@@ -104,24 +105,32 @@ class Probe(ABC):
     def _is_max_aggregated(self, name: str) -> bool:
         return name in self.MAX_AGGREGATED
 
-    def _count_global_observation(self):
+    def _count_global_observation(self, metric_names: set[str] | None = None):
         """Count one complete layer observation for global averages."""
         if self.log_global:
             self._global_count += 1
+            if metric_names is None:
+                metric_names = set(self._global_accum)
+            for name in metric_names:
+                self._global_metric_counts[name] = self._global_metric_counts.get(name, 0) + 1
 
     def _flush_global_metrics(self):
         """Aggregate accumulated metrics into global keys and write to training_logs."""
         if self._global_count == 0:
             self._global_accum.clear()
+            self._global_metric_counts.clear()
             return
         log_dict = {}
         for name, val in self._global_accum.items():
             if self._is_max_aggregated(name) or name in self.MIN_AGGREGATED:
                 log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val
             else:
-                log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val / self._global_count
+                count = self._global_metric_counts.get(name, self._global_count)
+                if count > 0:
+                    log_dict[f"{self.METRIC_PREFIX}/global_{name}"] = val / count
         training_logs.update(**log_dict)
         self._global_accum = {}
+        self._global_metric_counts = {}
         self._global_count = 0
 
     def _resolve_layer_idx(self, layer, local_idx: int, num_local_layers: int, layer_offset: int = 0) -> int:

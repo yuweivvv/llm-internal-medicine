@@ -20,6 +20,7 @@ PaddleMassiveActivationMonitor = importlib.import_module(
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
 PaddleQKStatsMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor").PaddleQKStatsMonitor
+layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
 
 
@@ -29,6 +30,27 @@ class BrokenPaddleMoELayer:
     @property
     def grouped_gemm_experts(self):
         raise RuntimeError("grouped expert read failed")
+
+
+class PaddleLayerDiscoveryTest(unittest.TestCase):
+    def test_get_decoder_layers_flattens_virtual_pipeline_chunks(self):
+        layer0 = SimpleNamespace(layer_idx=0)
+        layer1 = SimpleNamespace(layer_idx=1)
+        layer2 = SimpleNamespace(layer_idx=2)
+        model = SimpleNamespace(
+            _model_chunks=[
+                SimpleNamespace(run_function=[layer0, layer1]),
+                SimpleNamespace(run_function=[layer2]),
+            ]
+        )
+
+        self.assertEqual(layer_discovery.get_decoder_layers(model), [layer0, layer1, layer2])
+
+    def test_get_decoder_layers_checks_wrapped_module_after_empty_layers_wrapper(self):
+        layer = SimpleNamespace(layer_idx=0)
+        model = SimpleNamespace(_layers=SimpleNamespace(), module=SimpleNamespace(run_function=[layer]))
+
+        self.assertEqual(layer_discovery.get_decoder_layers(model), [layer])
 
 
 class PaddleMoEMonitorTest(unittest.TestCase):
