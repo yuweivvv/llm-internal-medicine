@@ -35,6 +35,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
+from .layer_discovery import get_decoder_layers, iter_monitor_layers
 from .massive_activation_metrics import (
     DEFAULT_ABSOLUTE_THRESHOLDS,
     _threshold_key,
@@ -118,48 +119,52 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         except Exception:
             pass
 
-        layers = self._get_decoder_layers(model)
+        def is_transformer_layer(layer):
+            return hasattr(layer, "self_attn") or hasattr(layer, "self_attention") or hasattr(layer, "input_layernorm")
+
+        layers = get_decoder_layers(model)
+        if layers is None:
+            transformer_layers = [
+                sublayer for _name, sublayer in model.named_sublayers() if is_transformer_layer(sublayer)
+            ]
+            layers = transformer_layers if transformer_layers else None
         if not layers:
             logger.warning("[MassiveActMonitor] No transformer layers found!")
             return
-        layers = list(layers)
+
+        monitor_layers = iter_monitor_layers(layers, is_transformer_layer, pp_rank=self.pp_rank)
+
+        # Declare metric schema
+        metric_names = [
+            "channel_max",
+            "channel_median",
+            "channel_p95",
+            "channel_p99",
+            "channel_max_ratio",
+            "massive_act_channel_count",
+            "topk_channel_norm",
+            "activation_rms",
+            "post_norm_sparsity",
+            "post_norm_cosine",
+        ] + [f"channel_count_gt_{_threshold_key(t)}" for t in self.absolute_thresholds]
 
         registered = 0
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
-
-            if self.sample_layers and global_idx not in self.sample_layers:
+        for item in monitor_layers:
+            if self.sample_layers and item.idx not in self.sample_layers:
                 continue
-
-            hook = layer.register_forward_pre_hook(self._make_residual_hook(global_idx))
-            self.hooks.append(hook)
+            for m in metric_names:
+                self.declare_layer_metric(item.idx, m)
             registered += 1
 
-        logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
+        self.allocate_buffers()
 
-    def _get_decoder_layers(self, model):
-        """Find transformer decoder layers in PaddleFleet model hierarchy."""
-        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-            model = model._layers
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "run_function"):
-            return [
-                layer
-                for layer in model.run_function
-                if hasattr(layer, "self_attn") or hasattr(layer, "self_attention") or hasattr(layer, "input_layernorm")
-            ]
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        transformer_layers = []
-        for _name, sublayer in model.named_sublayers():
-            if hasattr(sublayer, "self_attn") or hasattr(sublayer, "self_attention"):
-                transformer_layers.append(sublayer)
-        return transformer_layers if transformer_layers else None
+        for item in monitor_layers:
+            if self.sample_layers and item.idx not in self.sample_layers:
+                continue
+            hook = item.layer.register_forward_pre_hook(self._make_residual_hook(item.idx))
+            self.hooks.append(hook)
+
+        logger.info(f"[MassiveActMonitor] Registered {registered} hooks.")
 
     def _make_residual_hook(self, layer_idx: int):
         def hook_fn(module, inputs):
@@ -216,13 +221,18 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
 
         per_channel_max = compute_per_channel_max(analysis_input)
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
-        metrics = summarize_per_channel_max(
+        stats = summarize_per_channel_max(
             per_channel_max,
             threshold_multiplier=self.spike_threshold_multiplier,
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
         )
-        metrics.update(compute_activation_scale_stats(analysis_input))
+        scale_stats = compute_activation_scale_stats(analysis_input)
+
+        for name, val in stats.items():
+            self.record_layer_metric(layer_idx, name, val)
+        for name, val in scale_stats.items():
+            self.record_layer_metric(layer_idx, name, val)
 
         norm_layer = getattr(module, "input_layernorm", None)
         if norm_layer is not None:
@@ -230,16 +240,20 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
                 normalized = norm_layer(analysis_input)
                 if isinstance(normalized, (tuple, list)):
                     normalized = normalized[0]
-                metrics["post_norm_sparsity"] = compute_post_norm_sparsity(normalized, epsilon=self.sparsity_epsilon)
-                metrics["post_norm_cosine"] = compute_post_norm_cosine_stability(
-                    normalized, num_sample_pairs=self.cosine_sample_pairs
+                self.record_layer_metric(
+                    layer_idx,
+                    "post_norm_sparsity",
+                    compute_post_norm_sparsity(normalized, epsilon=self.sparsity_epsilon),
+                )
+                self.record_layer_metric(
+                    layer_idx,
+                    "post_norm_cosine",
+                    compute_post_norm_cosine_stability(normalized, num_sample_pairs=self.cosine_sample_pairs),
                 )
             except Exception as e:
                 if self.verbose and layer_idx not in self._post_norm_failed_layers:
                     logger.warning(f"[MassiveActMonitor] Post-norm metrics disabled at layer {layer_idx}: {e}")
                     self._post_norm_failed_layers.add(layer_idx)
-
-        self._record_metrics(layer_idx, metrics)
 
     def _aggregate_per_channel_max(self, per_channel_max: paddle.Tensor) -> paddle.Tensor:
         """Aggregate token-sharded per-channel maxima across the TP group when available."""

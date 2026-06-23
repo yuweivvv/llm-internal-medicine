@@ -21,6 +21,7 @@ import paddle
 import paddle.nn as nn
 
 from .base import PaddleProbe
+from .layer_discovery import get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def _compute_router_entropy(probs):
     probs = probs.astype("float32").clip(min=1e-10)
     probs = probs / probs.sum(axis=-1, keepdim=True)
     entropy = -(probs * probs.log()).sum(axis=-1)
-    return float(entropy.mean())
+    return entropy.mean()
 
 
 def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=1, topk_group=1):
@@ -71,19 +72,19 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
 
     intersection = (set_with & set_without).astype("float32").sum()
     union = (set_with | set_without).astype("float32").sum()
-    return float(intersection / union.clip(min=1.0))
+    return intersection / union.clip(min=1.0)
 
 
 def _compute_expert_norms_paddle(weight_list):
-    """Compute L2 norms for a list of paddle weight tensors."""
+    """Compute L2 norms for a list of paddle weight tensors. Returns GPU tensors."""
     if not weight_list:
-        return {"expert_norm_mean": 0.0, "expert_norm_std": 0.0, "expert_norm_min": 0.0, "expert_norm_max": 0.0}
+        return {}
     norms = paddle.stack([w.astype("float32").norm() for w in weight_list])
     return {
-        "expert_norm_mean": float(norms.mean()),
-        "expert_norm_std": float(norms.std()) if norms.numel() > 1 else 0.0,
-        "expert_norm_min": float(norms.min()),
-        "expert_norm_max": float(norms.max()),
+        "expert_norm_mean": norms.mean(),
+        "expert_norm_std": norms.std() if norms.numel() > 1 else paddle.zeros(()),
+        "expert_norm_min": norms.min(),
+        "expert_norm_max": norms.max(),
     }
 
 
@@ -118,7 +119,6 @@ class PaddleMoEMonitor(PaddleProbe):
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self._patched_gates = []
-        self._pending_router_global_layers: set[int] = set()
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -134,6 +134,30 @@ class PaddleMoEMonitor(PaddleProbe):
             return
         if self.verbose:
             logger.info(f"[PaddleMoEMonitor] Found {len(moe_layers)} MoE layers.")
+
+        # Declare metric schema
+        for layer_idx, moe_layer in moe_layers:
+            gate_metrics = ["router_entropy", "score_sum_mean", "score_sum_min", "score_sum_max"]
+            if hasattr(moe_layer, "gate") and hasattr(moe_layer.gate, "e_score_correction_bias"):
+                gate_metrics += [
+                    "bias_affinity_jaccard",
+                    "expert_bias_mean",
+                    "expert_bias_std",
+                    "expert_bias_max",
+                    "expert_bias_min",
+                ]
+            expert_metrics = [
+                "expert_norm_mean",
+                "expert_norm_std",
+                "expert_norm_min",
+                "expert_norm_max",
+                "shared_expert_norm",
+                "shared_routed_ratio",
+            ]
+            for m in gate_metrics + expert_metrics:
+                self.declare_layer_metric(layer_idx, m)
+
+        self.allocate_buffers()
 
         for layer_idx, moe_layer in moe_layers:
             if hasattr(moe_layer, "gate"):
@@ -198,16 +222,26 @@ class PaddleMoEMonitor(PaddleProbe):
         self._patched_gates.append(gate)
 
     def _find_moe_layers(self, model: nn.Layer) -> list[tuple[int, nn.Layer]]:
-        moe_layers = []
-        layers = self._get_decoder_layers(model)
+        def has_moe(layer):
+            return (
+                (hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"))
+                or hasattr(layer, "moe")
+                or hasattr(layer, "gate")
+            )
+
+        layers = get_decoder_layers(model)
         if layers is None:
             for _name, sublayer in model.named_sublayers():
                 if sublayer.__class__.__name__ == "MoELayer":
-                    moe_layers.append((len(moe_layers), sublayer))
-            return moe_layers
+                    layers = [] if layers is None else layers
+                    layers.append(sublayer)
+            if layers is None:
+                return []
 
-        for local_idx, layer in enumerate(layers):
-            global_idx = self._resolve_layer_idx(layer, local_idx, len(layers))
+        monitor_layers = iter_monitor_layers(layers, has_moe, pp_rank=self.pp_rank)
+        moe_layers = []
+        for item in monitor_layers:
+            layer = item.layer
             moe_module = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
                 moe_module = layer.mlp
@@ -216,39 +250,8 @@ class PaddleMoEMonitor(PaddleProbe):
             elif hasattr(layer, "gate"):
                 moe_module = layer
             if moe_module is not None:
-                moe_layers.append((global_idx, moe_module))
+                moe_layers.append((item.idx, moe_module))
         return moe_layers
-
-    def _get_decoder_layers(self, model):
-        if hasattr(model, "_layers") and hasattr(model._layers, "run_function"):
-            model = model._layers
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "run_function"):
-            return [
-                layer
-                for layer in model.run_function
-                if hasattr(layer, "self_attn")
-                or hasattr(layer, "self_attention")
-                or (hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"))
-                or hasattr(layer, "moe")
-            ]
-        if hasattr(model, "decoder") and hasattr(model.decoder, "layers"):
-            return model.decoder.layers
-        if hasattr(model, "encoder") and hasattr(model.encoder, "layers"):
-            return model.encoder.layers
-        if hasattr(model, "layers"):
-            return model.layers
-        transformer_layers = []
-        for _name, sublayer in model.named_sublayers():
-            if (
-                hasattr(sublayer, "self_attn")
-                or hasattr(sublayer, "self_attention")
-                or (hasattr(sublayer, "mlp") and hasattr(sublayer.mlp, "gate"))
-                or hasattr(sublayer, "moe")
-            ):
-                transformer_layers.append(sublayer)
-        return transformer_layers if transformer_layers else None
 
     def _make_gate_hook(self, layer_idx: int, moe_layer: nn.Layer):
         def hook_fn(layer, inputs, outputs):
@@ -282,7 +285,6 @@ class PaddleMoEMonitor(PaddleProbe):
                 with paddle.no_grad():
                     self._compute_expert_metrics(layer_idx, layer)
             except Exception as e:
-                self._finalize_layer_observation(layer_idx)
                 if self.verbose:
                     logger.error(f"[PaddleMoEMonitor] MoE layer hook error layer {layer_idx}: {e}")
 
@@ -290,9 +292,6 @@ class PaddleMoEMonitor(PaddleProbe):
 
     def _compute_gate_metrics(self, layer_idx, gate, outputs, moe_layer):
         """Compute router metrics from gate forward output."""
-        metrics = {}
-
-        # Use _cached_gates (patched softmax output, pre-bias) as the canonical probability distribution
         cached_gates = getattr(gate, "_cached_gates", None)
         k = getattr(gate, "num_experts_per_tok", None)
 
@@ -301,13 +300,13 @@ class PaddleMoEMonitor(PaddleProbe):
                 logger.warning(f"[PaddleMoEMonitor] layer {layer_idx}: _cached_gates is None, gate patch may not work")
             return
 
-        metrics["router_entropy"] = _compute_router_entropy(cached_gates)
+        self.record_layer_metric(layer_idx, "router_entropy", _compute_router_entropy(cached_gates))
         if k is not None:
             topk_vals, _ = paddle.topk(cached_gates, k, axis=-1)
             score_sum = topk_vals.sum(axis=-1)
-            metrics["score_sum_mean"] = float(score_sum.mean())
-            metrics["score_sum_min"] = float(score_sum.min())
-            metrics["score_sum_max"] = float(score_sum.max())
+            self.record_layer_metric(layer_idx, "score_sum_mean", score_sum.mean())
+            self.record_layer_metric(layer_idx, "score_sum_min", score_sum.min())
+            self.record_layer_metric(layer_idx, "score_sum_max", score_sum.max())
 
         if hasattr(gate, "e_score_correction_bias"):
             top_idx_with_bias = None
@@ -316,30 +315,18 @@ class PaddleMoEMonitor(PaddleProbe):
             if top_idx_with_bias is not None and k is not None:
                 n_group = getattr(gate, "n_group", 1)
                 topk_group = getattr(gate, "topk_group", 1)
-                metrics["bias_affinity_jaccard"] = _compute_bias_affinity_jaccard(
-                    top_idx_with_bias, cached_gates, k, n_group, topk_group
+                self.record_layer_metric(
+                    layer_idx,
+                    "bias_affinity_jaccard",
+                    _compute_bias_affinity_jaccard(top_idx_with_bias, cached_gates, k, n_group, topk_group),
                 )
             bias = gate.e_score_correction_bias
-            metrics["expert_bias_mean"] = float(bias.mean())
-            metrics["expert_bias_std"] = float(bias.std())
-            metrics["expert_bias_max"] = float(bias.max())
-            metrics["expert_bias_min"] = float(bias.min())
-
-        # Per-layer log + global accumulate (no count increment — expert hook does that)
-        self._log_per_layer_metrics(layer_idx, metrics)
-        if self.log_global and metrics:
-            self._accumulate_global(metrics)
-            self._pending_router_global_layers.add(layer_idx)
-
-    def _finalize_layer_observation(self, layer_idx: int, *, has_expert_metrics: bool = False):
-        """Finish one MoE layer observation and count global aggregation once."""
-        has_pending_router = layer_idx in self._pending_router_global_layers
-        if has_expert_metrics or has_pending_router:
-            self._count_global_observation()
-        self._pending_router_global_layers.discard(layer_idx)
+            self.record_layer_metric(layer_idx, "expert_bias_mean", bias.mean())
+            self.record_layer_metric(layer_idx, "expert_bias_std", bias.std())
+            self.record_layer_metric(layer_idx, "expert_bias_max", bias.max())
+            self.record_layer_metric(layer_idx, "expert_bias_min", bias.min())
 
     def _compute_expert_metrics(self, layer_idx, moe_layer):
-        metrics = {}
         routed_norm_mean = None
 
         if hasattr(moe_layer, "grouped_gemm_experts") and moe_layer.grouped_gemm_experts is not None:
@@ -359,8 +346,9 @@ class PaddleMoEMonitor(PaddleProbe):
                         expert_weights.append(combined)
             if expert_weights:
                 norm_stats = _compute_expert_norms_paddle(expert_weights)
-                metrics.update(norm_stats)
-                routed_norm_mean = norm_stats["expert_norm_mean"]
+                for name, val in norm_stats.items():
+                    self.record_layer_metric(layer_idx, name, val)
+                routed_norm_mean = norm_stats.get("expert_norm_mean")
 
         elif hasattr(moe_layer, "experts") and moe_layer.experts is not None:
             expert_weights = []
@@ -371,22 +359,20 @@ class PaddleMoEMonitor(PaddleProbe):
                         expert_weights.append(combined)
             if expert_weights:
                 norm_stats = _compute_expert_norms_paddle(expert_weights)
-                metrics.update(norm_stats)
-                routed_norm_mean = norm_stats["expert_norm_mean"]
+                for name, val in norm_stats.items():
+                    self.record_layer_metric(layer_idx, name, val)
+                routed_norm_mean = norm_stats.get("expert_norm_mean")
 
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
             all_params = _safe_concat_weights(moe_layer.shared_experts.parameters())
             if all_params is not None:
-                shared_norm = float(all_params.astype("float32").norm())
-                metrics["shared_expert_norm"] = shared_norm
-                if routed_norm_mean is not None and routed_norm_mean > 1e-8:
-                    metrics["shared_routed_ratio"] = shared_norm / routed_norm_mean
-
-        if metrics:
-            self._log_per_layer_metrics(layer_idx, metrics)
-            if self.log_global:
-                self._accumulate_global(metrics)
-        self._finalize_layer_observation(layer_idx, has_expert_metrics=bool(metrics))
+                shared_norm = all_params.astype("float32").norm()
+                self.record_layer_metric(layer_idx, "shared_expert_norm", shared_norm)
+                if routed_norm_mean is not None:
+                    # clip 防止除零（对齐 megatron compute_shared_routed_ratio），保持 GPU 张量无 D2H
+                    self.record_layer_metric(
+                        layer_idx, "shared_routed_ratio", shared_norm / routed_norm_mean.clip(min=1e-8)
+                    )
 
     def remove_hooks(self):
         super().remove_hooks()
@@ -398,13 +384,9 @@ class PaddleMoEMonitor(PaddleProbe):
                 if hasattr(gate, attr):
                     delattr(gate, attr)
         self._patched_gates = []
-        self._pending_router_global_layers.clear()
 
     def step(self):
-        for layer_idx in list(self._pending_router_global_layers):
-            self._finalize_layer_observation(layer_idx)
         super().step()
-        self._pending_router_global_layers.clear()
 
 
 def setup_moe_monitor(

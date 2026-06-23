@@ -38,46 +38,52 @@ class PaddleMoEMonitorTest(unittest.TestCase):
     def tearDown(self):
         training_logs.reset()
 
-    def test_router_only_global_observation_is_counted_once(self):
+    def test_gpu_buffer_gate_metrics_recorded(self):
+        """Gate hook records metrics via GPU-buffer API without D2H sync."""
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)
-        monitor._log_per_layer_metrics(0, {"router_entropy": 2.0})
-        monitor._accumulate_global({"router_entropy": 2.0})
-        monitor._pending_router_global_layers.add(0)
+        # Manually declare and allocate for layer 0
+        for m in ["router_entropy", "score_sum_mean", "score_sum_min", "score_sum_max"]:
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
 
-        monitor._finalize_layer_observation(0)
-        self.assertEqual(monitor._global_count, 1)
-        self.assertEqual(monitor._pending_router_global_layers, set())
-
+        # Simulate recording
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(2.0))
         monitor.step()
-        latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/layer_0/router_entropy"], 2.0)
-        self.assertEqual(latest["moe_health/global_router_entropy"], 2.0)
 
-    def test_step_finalizes_pending_router_metrics_before_flush(self):
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertAlmostEqual(latest["moe_health/layer_0/router_entropy"], 2.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 2.0, places=4)
+
+    def test_gpu_buffer_multi_layer_global_aggregation(self):
+        """Global metrics are derived from layer accumulators at flush time."""
         monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True)
-        monitor._accumulate_global({"router_entropy": 4.0})
-        monitor._pending_router_global_layers.add(3)
+        for layer_idx in (0, 1):
+            for m in ["router_entropy", "score_sum_max"]:
+                monitor.declare_layer_metric(layer_idx, m)
+        monitor.allocate_buffers()
 
+        monitor.record_layer_metric(0, "router_entropy", paddle.to_tensor(2.0))
+        monitor.record_layer_metric(1, "router_entropy", paddle.to_tensor(4.0))
+        monitor.record_layer_metric(0, "score_sum_max", paddle.to_tensor(0.8))
+        monitor.record_layer_metric(1, "score_sum_max", paddle.to_tensor(0.9))
         monitor.step()
 
         latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/global_router_entropy"], 4.0)
-        self.assertEqual(monitor._global_count, 0)
-        self.assertEqual(monitor._pending_router_global_layers, set())
+        self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
+        self.assertAlmostEqual(latest["moe_health/global_score_sum_max"], 0.9, places=4)
 
-    def test_expert_hook_exception_finalizes_pending_router_metrics(self):
+    def test_expert_hook_exception_does_not_crash(self):
+        """Expert hook exceptions are caught without crashing the step."""
         monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True, verbose=False)
-        monitor._accumulate_global({"router_entropy": 6.0})
-        monitor._pending_router_global_layers.add(2)
+        for m in ["expert_norm_mean", "expert_norm_std", "expert_norm_min", "expert_norm_max"]:
+            monitor.declare_layer_metric(2, m)
+        monitor.allocate_buffers()
 
         hook = monitor._make_moe_layer_hook(2, BrokenPaddleMoELayer())
         hook(BrokenPaddleMoELayer(), (), None)
 
-        self.assertEqual(monitor._global_count, 1)
-        self.assertEqual(monitor._pending_router_global_layers, set())
+        # Should not crash; step should still work
         monitor.step()
-        latest = training_logs.get_latest(prefix="moe_health")
-        self.assertEqual(latest["moe_health/global_router_entropy"], 6.0)
 
 
 class PaddleMassiveActivationMonitorTest(unittest.TestCase):
@@ -111,6 +117,25 @@ class PaddleMassiveActivationMonitorTest(unittest.TestCase):
             dtype="float32",
         )
 
+        # Must declare + allocate before _compute_and_log
+        metric_names = [
+            "channel_max",
+            "channel_median",
+            "channel_p95",
+            "channel_p99",
+            "channel_max_ratio",
+            "massive_act_channel_count",
+            "topk_channel_norm",
+            "activation_rms",
+            "post_norm_sparsity",
+            "post_norm_cosine",
+            "channel_count_gt_2",
+            "channel_count_gt_3",
+        ]
+        for m in metric_names:
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
         monitor._compute_and_log(0, hidden_states, nn.Layer())
         monitor.step()
 
@@ -139,22 +164,18 @@ class PaddleMassiveActivationMonitorTest(unittest.TestCase):
             absolute_thresholds=(2.0, 3.0),
         )
 
-        monitor._record_metrics(
-            0,
-            {
-                "massive_act_channel_count": 0.0,
-                "channel_count_gt_2": 1.0,
-                "channel_count_gt_3": 0.0,
-            },
-        )
-        monitor._record_metrics(
-            1,
-            {
-                "massive_act_channel_count": 2.0,
-                "channel_count_gt_2": 3.0,
-                "channel_count_gt_3": 1.0,
-            },
-        )
+        # Declare and allocate for 2 layers
+        for layer_idx in (0, 1):
+            for m in ["massive_act_channel_count", "channel_count_gt_2", "channel_count_gt_3"]:
+                monitor.declare_layer_metric(layer_idx, m)
+        monitor.allocate_buffers()
+
+        monitor.record_layer_metric(0, "massive_act_channel_count", paddle.to_tensor(0.0))
+        monitor.record_layer_metric(0, "channel_count_gt_2", paddle.to_tensor(1.0))
+        monitor.record_layer_metric(0, "channel_count_gt_3", paddle.to_tensor(0.0))
+        monitor.record_layer_metric(1, "massive_act_channel_count", paddle.to_tensor(2.0))
+        monitor.record_layer_metric(1, "channel_count_gt_2", paddle.to_tensor(3.0))
+        monitor.record_layer_metric(1, "channel_count_gt_3", paddle.to_tensor(1.0))
         monitor.step()
 
         latest = training_logs.get_latest(prefix="massive_act")
