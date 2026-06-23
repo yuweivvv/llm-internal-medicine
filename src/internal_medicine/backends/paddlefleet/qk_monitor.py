@@ -35,7 +35,7 @@ def compute_sink_head_classification(sink_per_head: paddle.Tensor, threshold: fl
 
     is_sink = sink_per_head > threshold
     is_sink_f = is_sink.astype("float32")
-    is_nonsink_f = (~is_sink).astype("float32")
+    is_nonsink_f = paddle.logical_not(is_sink).astype("float32")
     sink_count = is_sink_f.sum()
     nonsink_count = is_nonsink_f.sum()
     sink_head_ratio = sink_count / float(num_heads)
