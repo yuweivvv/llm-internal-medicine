@@ -44,6 +44,20 @@ class CoreMonitoringTest(unittest.TestCase):
         self.assertEqual(latest["dummy/global_floor"], 1.0)
         self.assertEqual(probe._global_count, 0)
         self.assertEqual(probe._global_accum, {})
+        self.assertEqual(probe._global_metric_counts, {})
+
+    def test_sparse_global_metrics_use_per_metric_counts(self):
+        probe = DummyProbe(log_per_layer=False, log_global=True)
+
+        probe._accumulate_global({"common": 2.0, "sparse": 4.0})
+        probe._count_global_observation({"common", "sparse"})
+        probe._accumulate_global({"common": 6.0})
+        probe._count_global_observation({"common"})
+        probe.step()
+
+        latest = training_logs.get_latest(prefix="dummy")
+        self.assertEqual(latest["dummy/global_common"], 4.0)
+        self.assertEqual(latest["dummy/global_sparse"], 4.0)
 
     def test_log_flags_are_respected(self):
         probe = DummyProbe(log_per_layer=False, log_global=True)
