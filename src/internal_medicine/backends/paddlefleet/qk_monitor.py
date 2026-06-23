@@ -15,6 +15,50 @@ from .base import PaddleProbe
 logger = logging.getLogger(__name__)
 
 
+def compute_sink_head_classification(sink_per_head: paddle.Tensor, threshold: float = 0.3) -> dict:
+    """Classify attention heads as sink vs non-sink.
+
+    Mirrors the megatron-side ``sink_head_metrics.compute_sink_head_classification``
+    using paddle ops. ``sink_per_head`` is a 1-D tensor of length num_heads
+    holding the mean attention weight on token-0 per head (already averaged
+    across batch).
+
+    Returns a dict with three GPU 0-dim tensors:
+        sink_head_ratio  — fraction of heads with sink weight > threshold
+        sink_head_max    — max sink weight across heads
+        sink_nonsink_gap — mean(sink) - mean(non-sink); 0 if no sinks; mean if all sinks
+    """
+    num_heads = int(sink_per_head.numel())
+    if num_heads == 0:
+        zero = sink_per_head.sum()
+        return {"sink_head_ratio": zero, "sink_head_max": zero, "sink_nonsink_gap": zero}
+
+    is_sink = sink_per_head > threshold
+    is_sink_f = is_sink.astype("float32")
+    is_nonsink_f = (~is_sink).astype("float32")
+    sink_count = is_sink_f.sum()
+    nonsink_count = is_nonsink_f.sum()
+    sink_head_ratio = sink_count / float(num_heads)
+    sink_head_max = sink_per_head.max()
+
+    zero = sink_per_head.sum() * 0.0
+    sink_sum = (sink_per_head * is_sink_f).sum()
+    nonsink_sum = (sink_per_head * is_nonsink_f).sum()
+    sink_mean = sink_sum / sink_count.clip(min=1.0)
+    nonsink_mean = nonsink_sum / nonsink_count.clip(min=1.0)
+    gap = paddle.where(
+        sink_count == 0,
+        zero,
+        paddle.where(nonsink_count == 0, sink_per_head.mean(), sink_mean - nonsink_mean),
+    )
+
+    return {
+        "sink_head_ratio": sink_head_ratio,
+        "sink_head_max": sink_head_max,
+        "sink_nonsink_gap": gap,
+    }
+
+
 _triton_driver_patched = False
 
 
@@ -127,16 +171,25 @@ def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = T
 
 class PaddleQKStatsMonitor(PaddleProbe):
     METRIC_PREFIX = "qk_stats"
-    MAX_AGGREGATED = {"max", "entropy_max"}
+    MAX_AGGREGATED = {"max", "entropy_max", "sink_head_max"}
     MIN_AGGREGATED = {"entropy_min"}
 
-    def __init__(self, causal=True, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        causal=True,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        sink_head_threshold: float = 0.3,
+    ):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self.causal = causal
         self.tp_size = 1
         self.pp_rank = 0
+        self.sink_head_threshold = sink_head_threshold
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -164,7 +217,18 @@ class PaddleQKStatsMonitor(PaddleProbe):
             logger.info(f"[PaddleQKMonitor] Found {len(attention_layers)} attention layers. TP={self.tp_size}")
 
         for layer_idx, _ in attention_layers:
-            for m in ("max", "mean", "entropy_avg", "sink", "entropy_min", "entropy_max", "entropy_std"):
+            for m in (
+                "max",
+                "mean",
+                "entropy_avg",
+                "sink",
+                "entropy_min",
+                "entropy_max",
+                "entropy_std",
+                "sink_head_ratio",
+                "sink_head_max",
+                "sink_nonsink_gap",
+            ):
                 self.declare_layer_metric(layer_idx, m)
 
         self.allocate_buffers()
@@ -231,6 +295,12 @@ class PaddleQKStatsMonitor(PaddleProbe):
                 self.record_layer_metric(layer_idx, "entropy_min", all_heads.min())
                 self.record_layer_metric(layer_idx, "entropy_max", all_heads.max())
                 self.record_layer_metric(layer_idx, "entropy_std", all_heads.std())
+                # sink_per_head: [B, H] — average across batch to get [H]
+                sink_per_head = stats["sink_per_head"]
+                sink_for_classify = sink_per_head.mean(axis=0) if sink_per_head.ndim > 1 else sink_per_head
+                sink_class = compute_sink_head_classification(sink_for_classify, threshold=self.sink_head_threshold)
+                for name, val in sink_class.items():
+                    self.record_layer_metric(layer_idx, name, val)
             except Exception as e:
                 logger.error(f"[PaddleQKMonitor] Error layer {layer_idx}: {e}")
 
@@ -244,6 +314,7 @@ def setup_qk_monitor(
     log_per_layer=True,
     log_global=True,
     monitor_interval=1,
+    sink_head_threshold: float = 0.3,
     monitor_dict=None,
 ):
     monitor = PaddleQKStatsMonitor(
@@ -252,6 +323,7 @@ def setup_qk_monitor(
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        sink_head_threshold=sink_head_threshold,
     )
     monitor.register_hooks(model)
     logger.info(f"[PaddleQKMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")

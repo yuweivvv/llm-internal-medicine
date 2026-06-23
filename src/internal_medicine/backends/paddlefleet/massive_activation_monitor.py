@@ -99,6 +99,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         self.tp_group = None
         self._warned_per_channel_aggregate = False
         self._post_norm_failed_layers: set[int] = set()
+        self._hc_aggregate_failed_layers: set[int] = set()
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -220,7 +221,23 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         return None
 
     def _compute_and_log(self, layer_idx: int, hidden_states: paddle.Tensor, module: nn.Layer):
-        per_channel_max = compute_per_channel_max(hidden_states)
+        # HyperConnection (e.g. DSv4): the residual stream is expanded to [..., n*h].
+        hc = getattr(module, "self_attention_hyper_connection", None)
+        analysis_input = hidden_states
+        if hc is not None:
+            try:
+                hc_out = hc(hidden_states)
+                aggregated = hc_out[0] if isinstance(hc_out, (tuple, list)) else hc_out
+                if isinstance(aggregated, paddle.Tensor) and aggregated.shape[-1] != hidden_states.shape[-1]:
+                    analysis_input = aggregated
+            except Exception as e:
+                if self.verbose and layer_idx not in self._hc_aggregate_failed_layers:
+                    logger.warning(
+                        f"[MassiveActMonitor] hyper_connection aggregate failed at layer {layer_idx}: {e}"
+                    )
+                    self._hc_aggregate_failed_layers.add(layer_idx)
+
+        per_channel_max = compute_per_channel_max(analysis_input)
         per_channel_max = self._aggregate_per_channel_max(per_channel_max)
         stats = summarize_per_channel_max(
             per_channel_max,
@@ -228,7 +245,7 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
             k=self.topk_channels,
             absolute_thresholds=self.absolute_thresholds,
         )
-        scale_stats = compute_activation_scale_stats(hidden_states)
+        scale_stats = compute_activation_scale_stats(analysis_input)
 
         for name, val in stats.items():
             self.record_layer_metric(layer_idx, name, val)
@@ -238,7 +255,9 @@ class PaddleMassiveActivationMonitor(PaddleProbe):
         norm_layer = getattr(module, "input_layernorm", None)
         if norm_layer is not None:
             try:
-                normalized = norm_layer(hidden_states)
+                normalized = norm_layer(analysis_input)
+                if isinstance(normalized, (tuple, list)):
+                    normalized = normalized[0]
                 self.record_layer_metric(
                     layer_idx,
                     "post_norm_sparsity",
