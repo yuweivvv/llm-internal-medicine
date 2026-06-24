@@ -166,15 +166,84 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/global_router_entropy"], 3.0, places=4)
         self.assertAlmostEqual(latest["moe_health/global_score_sum_max"], 0.9, places=4)
 
-    def test_expert_hook_exception_does_not_crash(self):
-        """Expert hook exceptions are caught without crashing the step."""
+    def test_fused_expert_norm_matches_per_expert_concat_norm(self):
+        """Vectorized per-expert norm equals the old concat([w1_i, w2_i]).norm()."""
+        moe_monitor_mod = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor")
+        num_experts, h, i = 4, 8, 6
+        w1 = paddle.randn([num_experts, h, i], dtype="float32")
+        w2 = paddle.randn([num_experts, i, h], dtype="float32")
+
+        got = moe_monitor_mod._per_expert_stacked_norms(w1, w2)
+        expected = paddle.stack([paddle.concat([w1[e].flatten(), w2[e].flatten()]).norm() for e in range(num_experts)])
+        self.assertEqual(list(got.shape), [num_experts])
+        self.assertTrue(bool(paddle.allclose(got, expected, atol=1e-5)))
+
+    def test_collect_expert_norms_fused_layout_records_metrics(self):
+        """collect_expert_norms records expert + shared norms for a fused-expert MoE layer."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, verbose=False)
+        for m in [
+            "expert_norm_mean",
+            "expert_norm_std",
+            "expert_norm_min",
+            "expert_norm_max",
+            "shared_expert_norm",
+            "shared_routed_ratio",
+        ]:
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        num_experts, h, i = 3, 8, 6
+        fused_experts = SimpleNamespace(
+            up_gate_proj=SimpleNamespace(weight=paddle.randn([num_experts, h, i], dtype="float32")),
+            down_proj=SimpleNamespace(weight=paddle.randn([num_experts, i, h], dtype="float32")),
+        )
+        shared = nn.Linear(h, i)
+        moe_layer = SimpleNamespace(experts=fused_experts, shared_experts=shared)
+        moe_layer.grouped_gemm_experts = None
+
+        monitor._expert_norm_layers = [(0, moe_layer)]
+        monitor.collect_expert_norms()
+        monitor.step()
+
+        latest = training_logs.get_latest(prefix="moe_health")
+        self.assertIn("moe_health/layer_0/expert_norm_mean", latest)
+        self.assertIn("moe_health/layer_0/shared_expert_norm", latest)
+        self.assertGreater(latest["moe_health/layer_0/expert_norm_mean"], 0.0)
+
+    def test_collect_expert_norms_respects_monitor_interval(self):
+        """Expert-norm collection is gated by the global monitor_interval."""
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, monitor_interval=2, verbose=False)
+        for m in ["expert_norm_mean", "expert_norm_std", "expert_norm_min", "expert_norm_max"]:
+            monitor.declare_layer_metric(0, m)
+        monitor.allocate_buffers()
+
+        num_experts, h, i = 2, 4, 4
+        fused_experts = SimpleNamespace(
+            up_gate_proj=SimpleNamespace(weight=paddle.randn([num_experts, h, i], dtype="float32")),
+            down_proj=SimpleNamespace(weight=paddle.randn([num_experts, i, h], dtype="float32")),
+        )
+        moe_layer = SimpleNamespace(experts=fused_experts, shared_experts=None)
+        moe_layer.grouped_gemm_experts = None
+        monitor._expert_norm_layers = [(0, moe_layer)]
+
+        # step_count=1 -> 1 % 2 != 0 -> should NOT record
+        monitor.step_count = 1
+        monitor.collect_expert_norms()
+        # nothing recorded -> count stays 0, flush emits nothing for this key
+        self.assertEqual(monitor._gpu_cnt["moe_health/layer_0/expert_norm_mean"], 0)
+
+    def test_expert_norm_collect_exception_does_not_crash(self):
+        """collect_expert_norms swallows per-layer read errors without crashing the step."""
         monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True, verbose=False)
         for m in ["expert_norm_mean", "expert_norm_std", "expert_norm_min", "expert_norm_max"]:
             monitor.declare_layer_metric(2, m)
         monitor.allocate_buffers()
 
-        hook = monitor._make_moe_layer_hook(2, BrokenPaddleMoELayer())
-        hook(BrokenPaddleMoELayer(), (), None)
+        # Expert norms are collected at step-begin from _expert_norm_layers,
+        # not from a forward hook. A layer that raises on weight access must be
+        # caught so the step still completes.
+        monitor._expert_norm_layers = [(2, BrokenPaddleMoELayer())]
+        monitor.collect_expert_norms()
 
         # Should not crash; step should still work
         monitor.step()

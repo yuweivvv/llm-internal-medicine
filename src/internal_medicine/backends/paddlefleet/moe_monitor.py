@@ -75,38 +75,34 @@ def _compute_bias_affinity_jaccard(top_idx_with_bias, gates_no_bias, k, n_group=
     return intersection / union.clip(min=1.0)
 
 
-def _compute_expert_norms_paddle(weight_list):
-    """Compute L2 norms for a list of paddle weight tensors. Returns GPU tensors."""
-    if not weight_list:
+def _per_expert_stacked_norms(w1, w2=None):
+    """Per-expert L2 norm over stacked expert weights, fully vectorized."""
+    num_experts = w1.shape[0]
+    sq = (w1.detach().astype("float32").reshape([num_experts, -1]) ** 2).sum(axis=-1)
+    if w2 is not None:
+        sq = sq + (w2.detach().astype("float32").reshape([num_experts, -1]) ** 2).sum(axis=-1)
+    return paddle.sqrt(sq)
+
+
+def _module_sumsq(module):
+    """Sum of squares over all parameters of a module. Returns a 0-dim GPU tensor or None."""
+    sq = None
+    for p in module.parameters():
+        part = (p.detach().astype("float32") ** 2).sum()
+        sq = part if sq is None else sq + part
+    return sq
+
+
+def _norm_stats(norms):
+    """mean/std/min/max stats from a ``[num_experts]`` per-expert norm tensor (GPU tensors)."""
+    if norms is None or norms.numel() == 0:
         return {}
-    norms = paddle.stack([w.astype("float32").norm() for w in weight_list])
     return {
         "expert_norm_mean": norms.mean(),
         "expert_norm_std": norms.std() if norms.numel() > 1 else paddle.zeros(()),
         "expert_norm_min": norms.min(),
         "expert_norm_max": norms.max(),
     }
-
-
-def _safe_flatten_weight(weight):
-    try:
-        return weight.detach().flatten()
-    except Exception:
-        return None
-
-
-def _safe_concat_weights(weights):
-    flattened = []
-    for weight in weights:
-        flat_weight = _safe_flatten_weight(weight)
-        if flat_weight is not None:
-            flattened.append(flat_weight)
-    if not flattened:
-        return None
-    try:
-        return paddle.concat(flattened)
-    except Exception:
-        return None
 
 
 class PaddleMoEMonitor(PaddleProbe):
@@ -119,6 +115,7 @@ class PaddleMoEMonitor(PaddleProbe):
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
         self._patched_gates = []
+        self._expert_norm_layers = []
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -159,15 +156,21 @@ class PaddleMoEMonitor(PaddleProbe):
 
         self.allocate_buffers()
 
+        self._expert_norm_layers = []
         for layer_idx, moe_layer in moe_layers:
             if hasattr(moe_layer, "gate"):
                 self._patch_gate_cache(moe_layer.gate)
                 hook = moe_layer.gate.register_forward_post_hook(self._make_gate_hook(layer_idx, moe_layer))
                 self.hooks.append(hook)
-            hook = moe_layer.register_forward_post_hook(self._make_moe_layer_hook(layer_idx, moe_layer))
-            self.hooks.append(hook)
+            # Expert weight norms are NOT collected from a forward hook: under
+            # offline FP8 quant the bf16 expert weights are cleared at step
+            # begin. collect_expert_norms() reads them before quant instead.
+            self._expert_norm_layers.append((layer_idx, moe_layer))
 
-        logger.info(f"[PaddleMoEMonitor] Registered {len(self.hooks)} hooks on {len(moe_layers)} layers.")
+        logger.info(
+            f"[PaddleMoEMonitor] Registered {len(self.hooks)} gate hooks and "
+            f"{len(self._expert_norm_layers)} expert-norm layers on {len(moe_layers)} MoE layers."
+        )
 
     def _patch_gate_cache(self, gate):
         """Monkey-patch gate.gate_score_func to cache pre-bias gates."""
@@ -283,20 +286,17 @@ class PaddleMoEMonitor(PaddleProbe):
 
         return hook_fn
 
-    def _make_moe_layer_hook(self, layer_idx: int, moe_layer: nn.Layer):
-        def hook_fn(layer, inputs, outputs):
-            if not layer.training:
-                return
-            if not self._should_monitor():
-                return
+    def collect_expert_norms(self):
+        """Compute per-layer expert weight norms for all monitored MoE layers."""
+        if not self._buffers_allocated or not self._should_monitor():
+            return
+        for layer_idx, moe_layer in self._expert_norm_layers:
             try:
                 with paddle.no_grad():
-                    self._compute_expert_metrics(layer_idx, layer)
+                    self._compute_expert_metrics(layer_idx, moe_layer)
             except Exception as e:
                 if self.verbose:
-                    logger.error(f"[PaddleMoEMonitor] MoE layer hook error layer {layer_idx}: {e}")
-
-        return hook_fn
+                    logger.error(f"[PaddleMoEMonitor] expert-norm collect error layer {layer_idx}: {e}")
 
     def _compute_gate_metrics(self, layer_idx, gate, outputs, moe_layer):
         """Compute router metrics from gate forward output."""
@@ -337,44 +337,48 @@ class PaddleMoEMonitor(PaddleProbe):
     def _compute_expert_metrics(self, layer_idx, moe_layer):
         routed_norm_mean = None
 
+        # grouped-gemm experts: weight1/weight2 are [num_experts, ...] blocks.
         if hasattr(moe_layer, "grouped_gemm_experts") and moe_layer.grouped_gemm_experts is not None:
             ggm = moe_layer.grouped_gemm_experts
-            expert_weights = []
             if hasattr(ggm, "weight1") and hasattr(ggm, "weight2"):
-                w1 = ggm.weight1
-                w2 = ggm.weight2
-                num_experts = w1.shape[0]
-                for i in range(num_experts):
-                    try:
-                        expert_parts = [w1[i], w2[i]]
-                    except Exception:
-                        continue
-                    combined = _safe_concat_weights(expert_parts)
-                    if combined is not None:
-                        expert_weights.append(combined)
-            if expert_weights:
-                norm_stats = _compute_expert_norms_paddle(expert_weights)
+                norms = _per_expert_stacked_norms(ggm.weight1, ggm.weight2)
+                norm_stats = _norm_stats(norms)
                 for name, val in norm_stats.items():
                     self.record_layer_metric(layer_idx, name, val)
                 routed_norm_mean = norm_stats.get("expert_norm_mean")
 
         elif hasattr(moe_layer, "experts") and moe_layer.experts is not None:
-            expert_weights = []
-            for expert in moe_layer.experts:
-                if expert is not None:
-                    combined = _safe_concat_weights(expert.parameters())
-                    if combined is not None:
-                        expert_weights.append(combined)
-            if expert_weights:
-                norm_stats = _compute_expert_norms_paddle(expert_weights)
+            experts = moe_layer.experts
+            norms = None
+            # Fused-expert layout (moe_expert_fusion=True): self.experts is a
+            # single module whose up_gate_proj/down_proj weights carry a leading
+            # expert dim [num_experts, ...]. Vectorize over that dim.
+            if hasattr(experts, "up_gate_proj") and hasattr(experts, "down_proj"):
+                w1 = experts.up_gate_proj.weight
+                w2 = experts.down_proj.weight
+                norms = _per_expert_stacked_norms(w1, w2)
+            elif isinstance(experts, (list, nn.LayerList)) or hasattr(experts, "__iter__"):
+                # Non-fused layout: LayerList of per-expert modules. One sum-sq
+                # per expert (each is a small handful of params), then stack.
+                per_expert = []
+                for expert in experts:
+                    if expert is None:
+                        continue
+                    sq = _module_sumsq(expert)
+                    if sq is not None:
+                        per_expert.append(paddle.sqrt(sq))
+                if per_expert:
+                    norms = paddle.stack(per_expert)
+            if norms is not None:
+                norm_stats = _norm_stats(norms)
                 for name, val in norm_stats.items():
                     self.record_layer_metric(layer_idx, name, val)
                 routed_norm_mean = norm_stats.get("expert_norm_mean")
 
         if hasattr(moe_layer, "shared_experts") and moe_layer.shared_experts is not None:
-            all_params = _safe_concat_weights(moe_layer.shared_experts.parameters())
-            if all_params is not None:
-                shared_norm = all_params.astype("float32").norm()
+            shared_sq = _module_sumsq(moe_layer.shared_experts)
+            if shared_sq is not None:
+                shared_norm = paddle.sqrt(shared_sq)
                 self.record_layer_metric(layer_idx, "shared_expert_norm", shared_norm)
                 if routed_norm_mean is not None:
                     # clip 防止除零（对齐 megatron compute_shared_routed_ratio），保持 GPU 张量无 D2H
@@ -395,6 +399,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 if hasattr(gate, attr):
                     delattr(gate, attr)
         self._patched_gates = []
+        self._expert_norm_layers = []
 
     def step(self):
         super().step()
