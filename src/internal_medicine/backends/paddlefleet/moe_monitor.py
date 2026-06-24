@@ -201,8 +201,12 @@ class PaddleMoEMonitor(PaddleProbe):
 
             def cached_hash_routing(logits, flat_ids):
                 result = original_hash_routing(logits, flat_ids)
-                # _hash_routing computes scores internally (softmax/sigmoid on logits).
-                # Recompute here to cache the full [N, num_experts] score distribution.
+                if not monitor._should_monitor():
+                    gate._cached_gates = None
+                    return result
+
+                # _hash_routing computes scores internally. Recompute the full
+                # [N, num_experts] distribution so router metrics can use it.
                 import paddle.nn.functional as F
 
                 logits_fp32 = logits.cast("float32")
@@ -211,8 +215,11 @@ class PaddleMoEMonitor(PaddleProbe):
                     scores = F.softmax(logits_fp32, axis=-1)
                 elif scoring_func == "sigmoid":
                     scores = F.sigmoid(logits_fp32)
+                elif scoring_func == "sqrtsoftplus":
+                    scores = paddle.sqrt(F.softplus(logits_fp32) + 1e-20)
                 else:
-                    scores = F.softmax(logits_fp32, axis=-1)
+                    gate._cached_gates = None
+                    return result
                 gate._cached_gates = scores.detach()
                 return result
 

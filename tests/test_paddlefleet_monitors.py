@@ -20,6 +20,7 @@ PaddleMassiveActivationMonitor = importlib.import_module(
 ).PaddleMassiveActivationMonitor
 PaddleMoEMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.moe_monitor").PaddleMoEMonitor
 PaddleQKStatsMonitor = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor").PaddleQKStatsMonitor
+paddlefleet_backend = importlib.import_module("internal_medicine.backends.paddlefleet")
 layer_discovery = importlib.import_module("internal_medicine.backends.paddlefleet.layer_discovery")
 training_logs = importlib.import_module("internal_medicine.core.training_logs").training_logs
 
@@ -30,6 +31,77 @@ class BrokenPaddleMoELayer:
     @property
     def grouped_gemm_experts(self):
         raise RuntimeError("grouped expert read failed")
+
+
+class DummyHook:
+    def __init__(self):
+        self.removed = False
+
+    def remove(self):
+        self.removed = True
+
+
+class DummyMonitor:
+    def __init__(self):
+        self.hooks = [DummyHook()]
+        self.removed = False
+
+    def remove_hooks(self):
+        self.removed = True
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+
+
+class PaddleFleetSetupTest(unittest.TestCase):
+    def setUp(self):
+        self.original_monitor_map = dict(paddlefleet_backend._MONITOR_MAP)
+
+    def tearDown(self):
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP.update(self.original_monitor_map)
+
+    def test_setup_monitors_reuses_existing_monitor_for_same_config(self):
+        created = []
+
+        def setup_dummy(_model, monitor_dict=None, **_kwargs):
+            monitor = DummyMonitor()
+            created.append(monitor)
+            monitor_dict["dummy"] = monitor
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP["dummy"] = setup_dummy
+        model = SimpleNamespace()
+        first = {}
+        second = {}
+
+        paddlefleet_backend.setup_monitors(model, monitors=["dummy"], monitor_dict=first, monitor_interval=2)
+        paddlefleet_backend.setup_monitors(model, monitors=["dummy"], monitor_dict=second, monitor_interval=2)
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(second["dummy"], first["dummy"])
+        self.assertFalse(first["dummy"].removed)
+
+    def test_setup_monitors_replaces_existing_monitor_when_config_changes(self):
+        created = []
+
+        def setup_dummy(_model, monitor_dict=None, **_kwargs):
+            monitor = DummyMonitor()
+            created.append(monitor)
+            monitor_dict["dummy"] = monitor
+
+        paddlefleet_backend._MONITOR_MAP.clear()
+        paddlefleet_backend._MONITOR_MAP["dummy"] = setup_dummy
+        model = SimpleNamespace()
+        first = {}
+        second = {}
+
+        paddlefleet_backend.setup_monitors(model, monitors=["dummy"], monitor_dict=first, monitor_interval=1)
+        paddlefleet_backend.setup_monitors(model, monitors=["dummy"], monitor_dict=second, monitor_interval=2)
+
+        self.assertEqual(len(created), 2)
+        self.assertTrue(first["dummy"].removed)
+        self.assertIs(second["dummy"], created[1])
 
 
 class PaddleLayerDiscoveryTest(unittest.TestCase):
@@ -106,6 +178,41 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
         # Should not crash; step should still work
         monitor.step()
+
+    def test_hash_routing_cache_supports_sqrtsoftplus(self):
+        monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True, verbose=False)
+        logits = paddle.to_tensor([[0.0, 1.0]], dtype="float32")
+
+        def original_hash_routing(logits, flat_ids):
+            return "ok"
+
+        gate = SimpleNamespace(
+            gate_score_func=lambda logits: logits,
+            _hash_routing=original_hash_routing,
+            scoring_func="sqrtsoftplus",
+        )
+        monitor._patch_gate_cache(gate)
+
+        self.assertEqual(gate._hash_routing(logits, paddle.to_tensor([0], dtype="int64")), "ok")
+        expected = paddle.sqrt(paddle.nn.functional.softplus(logits) + 1e-20)
+        self.assertTrue(bool(paddle.allclose(gate._cached_gates, expected)))
+
+        monitor.remove_hooks()
+        self.assertIs(gate._hash_routing, original_hash_routing)
+
+    def test_hash_routing_cache_respects_monitor_interval(self):
+        monitor = PaddleMoEMonitor(log_per_layer=False, log_global=True, monitor_interval=2, verbose=False)
+        logits = paddle.to_tensor([[0.0, 1.0]], dtype="float32")
+        gate = SimpleNamespace(
+            gate_score_func=lambda logits: logits,
+            _hash_routing=lambda logits, flat_ids: "ok",
+            scoring_func="sigmoid",
+        )
+        monitor._patch_gate_cache(gate)
+        monitor.step_count = 1
+
+        self.assertEqual(gate._hash_routing(logits, paddle.to_tensor([0], dtype="int64")), "ok")
+        self.assertIsNone(gate._cached_gates)
 
 
 class PaddleMassiveActivationMonitorTest(unittest.TestCase):

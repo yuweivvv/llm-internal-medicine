@@ -16,6 +16,22 @@ _MONITOR_MAP = {
     "massive_act": setup_massive_activation_monitor,
 }
 
+_MODEL_MONITOR_ATTR = "_internal_medicine_paddlefleet_monitors"
+_MONITOR_CONFIG_ATTR = "_internal_medicine_paddlefleet_config"
+
+
+def _monitor_config(monitor_interval, verbose, options):
+    return {
+        "monitor_interval": monitor_interval,
+        "verbose": verbose,
+        "options": repr(sorted(options.items())),
+    }
+
+
+def _monitor_has_active_hooks(monitor):
+    hooks = getattr(monitor, "hooks", None)
+    return bool(hooks)
+
 
 def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, verbose=False, **kwargs):
     """Setup all requested monitors on a PaddleFleet model."""
@@ -28,18 +44,41 @@ def setup_monitors(model, monitors=None, monitor_dict=None, monitor_interval=1, 
     if monitor_dict is None:
         monitor_dict = {}
 
+    model_monitor_dict = getattr(model, _MODEL_MONITOR_ATTR, None)
+    if model_monitor_dict is None:
+        model_monitor_dict = {}
+        setattr(model, _MODEL_MONITOR_ATTR, model_monitor_dict)
+
     for name in monitors:
         if name not in _MONITOR_MAP:
             logger.warning(f"[InternalMedicine/paddlefleet] Unknown monitor: {name}, skipping")
             continue
+        options = kwargs.get(name, {})
+        expected_config = _monitor_config(monitor_interval, verbose, options)
+        existing_monitor = model_monitor_dict.get(name)
+        if existing_monitor is not None:
+            existing_config = getattr(existing_monitor, _MONITOR_CONFIG_ATTR, None)
+            if _monitor_has_active_hooks(existing_monitor) and existing_config == expected_config:
+                monitor_dict[name] = existing_monitor
+                logger.info(
+                    f"[InternalMedicine/paddlefleet] Monitor already enabled: {name}, skipping duplicate setup"
+                )
+                continue
+            existing_monitor.remove_hooks()
+            model_monitor_dict.pop(name, None)
+
         try:
             _MONITOR_MAP[name](
                 model,
                 monitor_dict=monitor_dict,
                 monitor_interval=monitor_interval,
                 verbose=verbose,
-                **kwargs.get(name, {}),
+                **options,
             )
+            monitor = monitor_dict.get(name)
+            if monitor is not None:
+                setattr(monitor, _MONITOR_CONFIG_ATTR, expected_config)
+                model_monitor_dict[name] = monitor
             logger.info(f"[InternalMedicine/paddlefleet] Enabled monitor: {name}")
         except Exception as e:
             logger.error(f"[InternalMedicine/paddlefleet] Failed to setup {name}: {e}")
