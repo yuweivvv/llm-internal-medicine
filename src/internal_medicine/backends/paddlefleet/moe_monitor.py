@@ -216,6 +216,7 @@ class PaddleMoEMonitor(PaddleProbe):
                 gate._cached_gates = scores.detach()
                 return result
 
+            gate._im_original_hash_routing = original_hash_routing
             gate._hash_routing = cached_hash_routing
 
         gate._im_patched = True
@@ -380,7 +381,10 @@ class PaddleMoEMonitor(PaddleProbe):
             original_fn = getattr(gate, "_im_original_gate_score_func", None)
             if original_fn is not None:
                 gate.gate_score_func = original_fn
-            for attr in ("_im_original_gate_score_func", "_im_patched", "_cached_gates"):
+            original_hash_routing = getattr(gate, "_im_original_hash_routing", None)
+            if original_hash_routing is not None:
+                gate._hash_routing = original_hash_routing
+            for attr in ("_im_original_gate_score_func", "_im_original_hash_routing", "_im_patched", "_cached_gates"):
                 if hasattr(gate, attr):
                     delattr(gate, attr)
         self._patched_gates = []
