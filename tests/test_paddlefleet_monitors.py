@@ -392,6 +392,82 @@ class PaddleQKMonitorTest(unittest.TestCase):
         monitor.pp_rank = 1
         self.assertEqual(monitor._resolve_layer_idx(SimpleNamespace(), 2, 4), 6)
 
+    def test_row_stride_must_be_positive(self):
+        for bad in (0, -1, -32):
+            with self.assertRaises(ValueError):
+                PaddleQKStatsMonitor(row_stride=bad)
+
+    def test_row_stride_default_is_exact_full_pass(self):
+        self.assertEqual(PaddleQKStatsMonitor().row_stride, 1)
+
+
+class PaddleQKKernelComputeTest(unittest.TestCase):
+    """GPU numerical tests for the shared triton qk_stats kernel via paddle."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not paddle.device.is_compiled_with_cuda() or paddle.device.cuda.device_count() == 0:
+            raise unittest.SkipTest("qk_stats kernel requires a CUDA GPU")
+        paddle.device.set_device("gpu:0")
+        cls.qk = importlib.import_module("internal_medicine.backends.paddlefleet.qk_monitor")
+
+    def _gqa_inputs(self, B=1, S=128, Hq=8, Hkv=2, D=32, seed=0):
+        paddle.seed(seed)
+        q = paddle.randn([B, S, Hq, D], dtype="float32")
+        k = paddle.randn([B, S, Hkv, D], dtype="float32")
+        return q, k
+
+    def test_kernel_grouping_matches_explicit_repeat_interleave(self):
+        """GQA via in-kernel head mapping == materialized repeat_interleave."""
+        q, k = self._gqa_inputs()
+        heads_per_group = q.shape[2] // k.shape[2]
+
+        grouped = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+
+        k_expanded = k.repeat_interleave(heads_per_group, axis=2)
+        expanded = self.qk.compute_qk_stats_paddle(q, k_expanded, causal=True, row_stride=1)
+
+        for key in ("max_global", "mean_global", "entropy_global", "sink_global"):
+            self.assertTrue(
+                paddle.allclose(grouped[key], expanded[key], atol=1e-4, rtol=1e-4).item(),
+                f"{key} mismatch: grouped={grouped[key].item()} expanded={expanded[key].item()}",
+            )
+
+    def test_row_stride_is_near_unbiased_for_mean_class_metrics(self):
+        """Subsampling query rows must keep the row-averaged metrics close to
+        the full pass. entropy_global / mean_global / sink_global are all
+        uniform averages over query rows, so a uniform stride is an unbiased,
+        low-variance estimator. entropy has real magnitude -> tight relative
+        check; mean and sink sit near zero for N(0,1) inputs -> absolute check.
+        """
+        q, k = self._gqa_inputs(S=512, seed=1)
+        full = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+        sub = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=8)
+
+        rel = abs(sub["entropy_global"].item() - full["entropy_global"].item()) / (
+            abs(full["entropy_global"].item()) + 1e-6
+        )
+        self.assertLess(
+            rel, 0.1, f"entropy_global drifted: full={full['entropy_global'].item()} sub={sub['entropy_global'].item()}"
+        )
+
+        for key in ("mean_global", "sink_global"):
+            self.assertLess(
+                abs(sub[key].item() - full[key].item()),
+                0.05,
+                f"{key} drifted: full={full[key].item()} sub={sub[key].item()}",
+            )
+
+        # max is an extremum -> subsample is a lower bound (<= full).
+        self.assertLessEqual(sub["max_global"].item(), full["max_global"].item() + 1e-4)
+
+    def test_row_stride_one_is_exact_full_sequence(self):
+        q, k = self._gqa_inputs(Hkv=8, seed=2)  # MHA, no grouping
+        a = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+        b = self.qk.compute_qk_stats_paddle(q, k, causal=True, row_stride=1)
+        for key in ("max_global", "mean_global", "entropy_global", "sink_global"):
+            self.assertTrue(paddle.allclose(a[key], b[key], atol=1e-5).item())
+
 
 if __name__ == "__main__":
     unittest.main()

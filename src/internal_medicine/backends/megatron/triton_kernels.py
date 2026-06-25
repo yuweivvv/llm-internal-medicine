@@ -49,6 +49,7 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         num_heads,
         seq_len,
         head_dim,
+        1,  # heads_per_group: k is already repeat_interleave-expanded above
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -61,6 +62,7 @@ def compute_qk_stats_triton(q: torch.Tensor, k: torch.Tensor, causal: bool = Tru
         max_logits.stride(1),
         scale=scale,
         apply_causal_mask=causal,
+        ROW_STRIDE=1,  # full-sequence (exact) behavior, unchanged
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,

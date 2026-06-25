@@ -23,6 +23,8 @@ def qk_stats_kernel(
     num_heads,
     seq_len,
     head_dim,
+    # GQA: number of query heads sharing one KV head (1 == MHA)
+    heads_per_group,
     # Strides
     stride_q_batch,
     stride_q_head,
@@ -37,21 +39,35 @@ def qk_stats_kernel(
     # Configs
     scale: tl.constexpr,
     apply_causal_mask: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """Fused kernel for QK attention statistics via online softmax.
 
-    Grid: (batch * num_heads,) — one program per (batch, head).
-    Input layout: [B, H, S, D] (caller must permute beforehand).
+    Grid: (batch * num_heads,) — one program per (batch, query-head).
+    Input layout: [B, H, S, D].
+
+    GQA: K is indexed by ``head_idx // heads_per_group`` so the caller does
+    NOT need to materialize a ``repeat_interleave`` of the KV tensor. Pass
+    ``heads_per_group=1`` for MHA (no grouping).
+
+    Query-row subsampling: only every ``ROW_STRIDE``-th query row is visited
+    in the outer loop. The mean-class statistics (mean_logit, entropy, sink)
+    are row-averages, so a uniform stride is an unbiased estimator of the
+    full-sequence average at O(S/ROW_STRIDE) cost instead of O(S). Pass
+    ``ROW_STRIDE=1`` to recover the exact full-sequence behavior. Note that
+    ``max_logit`` is an extremum over the visited rows; with ROW_STRIDE>1 it
+    is a (typically tight) lower bound on the true max.
     """
     pid = tl.program_id(0)
     batch_idx = pid // num_heads
     head_idx = pid % num_heads
+    kv_head_idx = head_idx // heads_per_group
 
     q_base = Q_ptr + batch_idx * stride_q_batch + head_idx * stride_q_head
-    k_base = K_ptr + batch_idx * stride_k_batch + head_idx * stride_k_head
+    k_base = K_ptr + batch_idx * stride_k_batch + kv_head_idx * stride_k_head
 
     head_max_logit = -1e10
     head_sum_logit = 0.0
@@ -60,8 +76,10 @@ def qk_stats_kernel(
     head_sum_sink = 0.0
     head_valid_rows = 0.0
 
-    for m_start in range(0, seq_len, BLOCK_M):
-        m_offsets = m_start + tl.arange(0, BLOCK_M)
+    # Stride between consecutive visited query rows within a block.
+    m_block_span = BLOCK_M * ROW_STRIDE
+    for m_start in range(0, seq_len, m_block_span):
+        m_offsets = m_start + tl.arange(0, BLOCK_M) * ROW_STRIDE
         m_mask = m_offsets < seq_len
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10

@@ -93,8 +93,20 @@ def _ensure_triton_driver():
     _triton_driver_patched = True
 
 
-def _compute_qk_stats_triton(q: paddle.Tensor, k: paddle.Tensor, causal: bool = True) -> dict:
-    """Triton kernel path for paddle tensors. q, k: [B, H, S, D] on GPU."""
+def _compute_qk_stats_triton(
+    q: paddle.Tensor,
+    k: paddle.Tensor,
+    causal: bool = True,
+    heads_per_group: int = 1,
+    row_stride: int = 1,
+) -> dict:
+    """Triton kernel path for paddle tensors.
+
+    q: [B, H, S, D] (query heads). k: [B, H_kv, S, D] (KV heads, NOT expanded).
+    ``heads_per_group = H // H_kv``; the kernel maps each query head to its KV
+    head internally so we never materialize a repeat_interleave of k.
+    ``row_stride`` subsamples query rows (see kernel docstring).
+    """
     _ensure_triton_driver()
     from ...core.triton_qk_kernel import qk_stats_kernel
 
@@ -124,6 +136,7 @@ def _compute_qk_stats_triton(q: paddle.Tensor, k: paddle.Tensor, causal: bool = 
         num_heads,
         seq_len,
         head_dim,
+        heads_per_group,
         q.strides[0],
         q.strides[1],
         q.strides[2],
@@ -136,6 +149,7 @@ def _compute_qk_stats_triton(q: paddle.Tensor, k: paddle.Tensor, causal: bool = 
         max_logits.strides[1],
         scale=scale,
         apply_causal_mask=causal,
+        ROW_STRIDE=row_stride,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -153,21 +167,35 @@ def _compute_qk_stats_triton(q: paddle.Tensor, k: paddle.Tensor, causal: bool = 
     }
 
 
-def compute_qk_stats_paddle(q: paddle.Tensor, k: paddle.Tensor, causal: bool = True) -> dict:
+def compute_qk_stats_paddle(
+    q: paddle.Tensor,
+    k: paddle.Tensor,
+    causal: bool = True,
+    row_stride: int = 1,
+) -> dict:
     """Compute QK stats via Triton kernel.
 
     Args:
         q: [B, S, H, D] — PaddleFleet core_attention input format
-        k: same shape as q
-    """
-    # [B, S, H, D] → [B, H, S, D]
-    q = q.transpose([0, 2, 1, 3]).contiguous()
-    k = k.transpose([0, 2, 1, 3]).contiguous()
+        k: [B, S, H_kv, D] — KV heads (may be fewer than query heads for GQA)
+        row_stride: subsample every ``row_stride``-th query row (1 == exact)
 
+    The [B, S, H, D] -> [B, H, S, D] reordering is expressed via strides
+    (no contiguous copy); the triton kernel reads strided memory directly.
+    GQA grouping is handled inside the kernel, so k is NOT repeat-expanded.
+    """
     if not q.place.is_gpu_place():
         raise RuntimeError("[PaddleQKMonitor] QK stats requires GPU (triton kernel)")
 
-    return _compute_qk_stats_triton(q, k, causal)
+    num_q_heads = q.shape[2]
+    num_k_heads = k.shape[2]
+    heads_per_group = num_q_heads // num_k_heads if num_k_heads > 0 else 1
+
+    # [B, S, H, D] -> [B, H, S, D] without copying (stride permute only).
+    q = q.transpose([0, 2, 1, 3])
+    k = k.transpose([0, 2, 1, 3])
+
+    return _compute_qk_stats_triton(q, k, causal=causal, heads_per_group=heads_per_group, row_stride=row_stride)
 
 
 class PaddleQKStatsMonitor(PaddleProbe):
@@ -183,6 +211,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
         monitor_interval=1,
         verbose=False,
         sink_head_threshold: float = 0.3,
+        row_stride: int = 1,
     ):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
@@ -191,6 +220,11 @@ class PaddleQKStatsMonitor(PaddleProbe):
         self.tp_size = 1
         self.pp_rank = 0
         self.sink_head_threshold = sink_head_threshold
+        if int(row_stride) < 1:
+            raise ValueError(f"[PaddleQKMonitor] row_stride must be >= 1, got {row_stride}")
+        self.row_stride = int(row_stride)
+        # Warn at most once if a runtime seq_len ends up smaller than row_stride.
+        self._warned_row_stride_gt_seqlen = False
 
     def register_hooks(self, model: nn.Layer):
         try:
@@ -247,9 +281,7 @@ class PaddleQKStatsMonitor(PaddleProbe):
 
         layers = get_decoder_layers(model)
         if layers is None:
-            transformer_layers = [
-                sublayer for _name, sublayer in model.named_sublayers() if has_attention(sublayer)
-            ]
+            transformer_layers = [sublayer for _name, sublayer in model.named_sublayers() if has_attention(sublayer)]
             layers = transformer_layers if transformer_layers else None
         if layers is None:
             return []
@@ -271,10 +303,25 @@ class PaddleQKStatsMonitor(PaddleProbe):
             try:
                 query, key = inputs[0], inputs[1]
                 with paddle.no_grad():
-                    if query.shape[2] != key.shape[2]:
-                        heads_per_group = query.shape[2] // key.shape[2]
-                        key = key.repeat_interleave(heads_per_group, axis=2)
-                    stats = compute_qk_stats_paddle(query, key, causal=self.causal)
+                    # query: [B, S, H, D]; seq_len is a static shape int (no D2H sync).
+                    seq_len = query.shape[1]
+                    effective_stride = self.row_stride
+                    if effective_stride > seq_len:
+                        # Stride coarser than the sequence would visit a single
+                        # (or zero) row -> statistically useless. Clamp to a full
+                        # pass and warn once instead of silently degrading.
+                        if not self._warned_row_stride_gt_seqlen:
+                            logger.warning(
+                                "[PaddleQKMonitor] row_stride=%d exceeds seq_len=%d; "
+                                "clamping to 1 (full pass) for this run.",
+                                self.row_stride,
+                                seq_len,
+                            )
+                            self._warned_row_stride_gt_seqlen = True
+                        effective_stride = 1
+                    # GQA grouping is handled inside the kernel; do NOT
+                    # repeat_interleave the KV tensor on the hot path.
+                    stats = compute_qk_stats_paddle(query, key, causal=self.causal, row_stride=effective_stride)
 
                 all_heads = stats["entropy_per_head"]
                 self.record_layer_metric(layer_idx, "max", stats["max_global"])
@@ -304,6 +351,7 @@ def setup_qk_monitor(
     log_global=True,
     monitor_interval=1,
     sink_head_threshold: float = 0.3,
+    row_stride: int = 1,
     monitor_dict=None,
 ):
     monitor = PaddleQKStatsMonitor(
@@ -313,6 +361,7 @@ def setup_qk_monitor(
         monitor_interval=monitor_interval,
         verbose=verbose,
         sink_head_threshold=sink_head_threshold,
+        row_stride=row_stride,
     )
     monitor.register_hooks(model)
     logger.info(f"[PaddleQKMonitor] Setup complete. Monitoring {len(monitor.hooks)} layers.")
